@@ -1,0 +1,1440 @@
+#!/home/node/.openclaw/workspace/.uv/envs/default/bin/python
+"""
+zot - Zotero CLI for querying and managing research libraries
+
+Usage:
+    zot search <query> [--library personal|group] [--limit N] [--fulltext]
+    zot item <key> [--library personal|group]
+    zot pdf <key> [--library personal|group] [-o output.pdf]
+    zot collections [--library personal|group]
+    zot tags [--library personal|group]
+    zot add <title> --type <itemType> [--authors "Last, First; ..."] [--pdf file.pdf] [--collection name]
+    zot attach <key> [file.pdf | --url URL] [--library group]
+    zot note <key> [-c content | -f file.md] [--tags "t1,t2"]
+    zot notes <key> [--library personal|group]
+    zot annotations <key> [--library personal|group] [--format text|json] [--full]
+    zot render <key> <note.md> [-o name.pdf] [--no-attach] [--keep-tex]
+    zot cite <key> [--style apa|chicago|bibtex] [--library personal|group]
+    zot recent [--library personal|group] [--limit N]
+    zot export <key> [--format bibtex|ris|csljson] [--library personal|group]
+    zot index list|add|remove|find|sync [--key KEY] [--query Q]
+
+Environment:
+    ZOTERO_USER_ID, ZOTERO_PERSONAL_KEY (read-only personal library)
+    ZOTERO_GROUP_ID, ZOTERO_GROUP_KEY (read/write group library)
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+from urllib.parse import quote
+
+import httpx
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+API_BASE = "https://api.zotero.org"
+
+# Local storage directory (PDFs, index, notes)
+# Override with ZOTERO_LOCAL_DIR env var for per-agent isolation
+ZOTERO_LOCAL_DIR = Path(os.environ.get(
+    "ZOTERO_LOCAL_DIR",
+    Path.home() / ".openclaw" / "workspace" / "zotero-local"
+))
+
+def get_config():
+    return {
+        "user_id": os.environ.get("ZOTERO_USER_ID"),
+        "personal_key": os.environ.get("ZOTERO_PERSONAL_KEY"),
+        "group_id": os.environ.get("ZOTERO_GROUP_ID"),
+        "group_key": os.environ.get("ZOTERO_GROUP_KEY"),
+    }
+
+def get_library_info(library: str):
+    """Get prefix and API key for the specified library."""
+    cfg = get_config()
+    if library == "personal":
+        if not cfg["user_id"] or not cfg["personal_key"]:
+            print("Error: ZOTERO_USER_ID and ZOTERO_PERSONAL_KEY required", file=sys.stderr)
+            sys.exit(1)
+        return f"/users/{cfg['user_id']}", cfg["personal_key"]
+    elif library == "group":
+        if not cfg["group_id"] or not cfg["group_key"]:
+            print("Error: ZOTERO_GROUP_ID and ZOTERO_GROUP_KEY required", file=sys.stderr)
+            sys.exit(1)
+        return f"/groups/{cfg['group_id']}", cfg["group_key"]
+    else:
+        print(f"Error: Unknown library '{library}'", file=sys.stderr)
+        sys.exit(1)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API Client
+# ─────────────────────────────────────────────────────────────────────────────
+
+def api_request(method: str, endpoint: str, api_key: str, **kwargs):
+    """Make an API request to Zotero."""
+    headers = {
+        "Zotero-API-Key": api_key,
+        "Zotero-API-Version": "3",
+    }
+    if "headers" in kwargs:
+        headers.update(kwargs.pop("headers"))
+    
+    url = f"{API_BASE}{endpoint}"
+    
+    with httpx.Client(timeout=60, follow_redirects=True) as client:
+        resp = client.request(method, url, headers=headers, **kwargs)
+        
+        if resp.status_code >= 400:
+            print(f"Error {resp.status_code}: {resp.text}", file=sys.stderr)
+            sys.exit(1)
+        
+        return resp
+
+def api_get(endpoint: str, api_key: str, **params):
+    """GET request with query parameters."""
+    return api_request("GET", endpoint, api_key, params=params)
+
+def api_post(endpoint: str, api_key: str, data: dict, **kwargs):
+    """POST JSON data."""
+    headers = {"Content-Type": "application/json"}
+    return api_request("POST", endpoint, api_key, headers=headers, json=data, **kwargs)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Local Index (for tracking Zotero key ↔ local filename ↔ title)
+# ─────────────────────────────────────────────────────────────────────────────
+
+INDEX_PATH = ZOTERO_LOCAL_DIR / "index.json"
+
+def load_index():
+    """Load local index file."""
+    if INDEX_PATH.exists():
+        with open(INDEX_PATH) as f:
+            return json.load(f)
+    return {"items": {}}
+
+def save_index(index):
+    """Save local index file."""
+    INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(INDEX_PATH, "w") as f:
+        json.dump(index, f, indent=2)
+
+def extract_index_metadata(data: dict, library: str, filename: str = None) -> dict:
+    """Extract all index-relevant metadata from a Zotero item."""
+    # Authors: extract last names
+    authors = []
+    for creator in data.get("creators", []):
+        if creator.get("lastName"):
+            authors.append(creator["lastName"])
+        elif creator.get("name"):
+            # Single-field name (e.g., organization)
+            authors.append(creator["name"])
+    
+    # Year: extract from date field
+    date = data.get("date", "")
+    year = date[:4] if date and len(date) >= 4 else None
+    
+    # Tags: extract tag names
+    tags = [t.get("tag", "") for t in data.get("tags", []) if t.get("tag")]
+    
+    # Collections: store keys (we'll resolve names during sync if needed)
+    collections = data.get("collections", [])
+    
+    result = {
+        "title": data.get("title", "(unknown)"),
+        "library": library,
+        "authors": authors,
+        "year": year,
+        "tags": tags,
+        "doi": data.get("DOI"),
+        "itemType": data.get("itemType"),
+        "publication": data.get("publicationTitle"),
+        "url": data.get("url"),
+        "collections": collections,
+        "dateAdded": data.get("dateAdded"),
+    }
+    
+    if filename:
+        result["filename"] = filename
+    
+    # Remove None values to keep index clean
+    return {k: v for k, v in result.items() if v is not None}
+
+def fetch_collection_names(prefix: str, api_key: str) -> dict:
+    """Fetch all collections and return key -> name mapping."""
+    resp = api_get(f"{prefix}/collections", api_key, limit=100)
+    collections = resp.json()
+    return {c["data"]["key"]: c["data"]["name"] for c in collections}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cmd_search(args):
+    """Search for items by query."""
+    prefix, key = get_library_info(args.library)
+    
+    params = {
+        "q": args.query,
+        "limit": args.limit,
+        "sort": "dateModified",
+        "direction": "desc"
+    }
+    if args.fulltext:
+        params["qmode"] = "everything"
+    
+    resp = api_get(f"{prefix}/items", key, **params)
+    
+    items = resp.json()
+    
+    if not items:
+        print("No results found.")
+        return
+    
+    for item in items:
+        data = item.get("data", {})
+        item_type = data.get("itemType", "?")
+        if item_type == "attachment":
+            continue
+        
+        key = data.get("key", "?")
+        title = data.get("title", "(no title)")
+        
+        # Format creators
+        creators = data.get("creators", [])
+        if creators:
+            first_author = creators[0]
+            author = first_author.get("lastName") or first_author.get("name", "?")
+            if len(creators) > 1:
+                author += " et al."
+        else:
+            author = "?"
+        
+        date = data.get("date", "")
+        year = date[:4] if date else "?"
+        
+        print(f"[{key}] {author} ({year}): {title}")
+        
+        # Show abstract snippet if present
+        abstract = data.get("abstractNote", "")
+        if abstract and args.verbose:
+            snippet = abstract[:200] + "..." if len(abstract) > 200 else abstract
+            print(f"    {snippet}")
+            print()
+
+def cmd_item(args):
+    """Get detailed info about an item."""
+    prefix, key = get_library_info(args.library)
+    
+    resp = api_get(f"{prefix}/items/{args.key}", key)
+    item = resp.json()
+    data = item.get("data", {})
+    
+    print(f"Key: {data.get('key')}")
+    print(f"Type: {data.get('itemType')}")
+    print(f"Title: {data.get('title')}")
+    
+    creators = data.get("creators", [])
+    if creators:
+        print("Authors:")
+        for c in creators:
+            if c.get("firstName"):
+                print(f"  - {c.get('lastName', '')}, {c.get('firstName', '')} ({c.get('creatorType', '')})")
+            else:
+                print(f"  - {c.get('name', '')} ({c.get('creatorType', '')})")
+    
+    if data.get("date"):
+        print(f"Date: {data.get('date')}")
+    if data.get("publicationTitle"):
+        print(f"Publication: {data.get('publicationTitle')}")
+    if data.get("DOI"):
+        print(f"DOI: {data.get('DOI')}")
+    if data.get("url"):
+        print(f"URL: {data.get('url')}")
+    
+    tags = data.get("tags", [])
+    if tags:
+        print(f"Tags: {', '.join(t.get('tag', '') for t in tags)}")
+    
+    collections = data.get("collections", [])
+    if collections:
+        print(f"Collections: {', '.join(collections)}")
+    
+    abstract = data.get("abstractNote", "")
+    if abstract:
+        print(f"\nAbstract:\n{abstract}")
+    
+    # Check for attachments
+    resp2 = api_get(f"{prefix}/items/{args.key}/children", key)
+    children = resp2.json()
+    attachments = [c for c in children if c.get("data", {}).get("itemType") == "attachment"]
+    if attachments:
+        print("\nAttachments:")
+        for att in attachments:
+            att_data = att.get("data", {})
+            print(f"  [{att_data.get('key')}] {att_data.get('filename', att_data.get('title', '?'))} ({att_data.get('contentType', '?')})")
+
+def cmd_pdf(args):
+    """Download PDF attachment."""
+    prefix, api_key = get_library_info(args.library)
+    
+    # First check if this is an attachment or parent item
+    resp = api_get(f"{prefix}/items/{args.key}", api_key)
+    item = resp.json()
+    data = item.get("data", {})
+    
+    attachment_key = args.key
+    parent_key = args.key
+    parent_data = data  # Will hold the parent item's full data for indexing
+    filename = args.output
+    
+    if data.get("itemType") != "attachment":
+        # This is a parent item - find PDF attachment
+        resp2 = api_get(f"{prefix}/items/{args.key}/children", api_key)
+        children = resp2.json()
+        
+        pdf_attachments = [
+            c for c in children 
+            if c.get("data", {}).get("contentType") == "application/pdf"
+        ]
+        
+        if not pdf_attachments:
+            print("No PDF attachment found for this item.", file=sys.stderr)
+            sys.exit(1)
+        
+        attachment_key = pdf_attachments[0].get("data", {}).get("key")
+        if not filename:
+            filename = pdf_attachments[0].get("data", {}).get("filename", f"{args.key}.pdf")
+    else:
+        # This is an attachment - get parent item data
+        parent_key = data.get("parentItem")
+        if parent_key:
+            try:
+                resp_parent = api_get(f"{prefix}/items/{parent_key}", api_key)
+                parent_data = resp_parent.json().get("data", {})
+            except:
+                parent_data = {"title": "(unknown)"}
+        if not filename:
+            filename = data.get("filename", f"{args.key}.pdf")
+    
+    # Download the file
+    resp3 = api_request("GET", f"{prefix}/items/{attachment_key}/file", api_key)
+    
+    # If no output path specified, save to zotero-local directory
+    if not args.output:
+        zotero_dir = ZOTERO_LOCAL_DIR
+        zotero_dir.mkdir(parents=True, exist_ok=True)
+        filename = zotero_dir / filename
+    
+    with open(filename, "wb") as f:
+        f.write(resp3.content)
+    
+    print(f"Downloaded: {filename} ({len(resp3.content)} bytes)")
+    
+    # Auto-add to local index with full metadata
+    index = load_index()
+    index["items"][parent_key] = extract_index_metadata(
+        parent_data, args.library, Path(filename).name
+    )
+    save_index(index)
+    print(f"  → Indexed as [{parent_key}]")
+
+def cmd_collections(args):
+    """List collections."""
+    prefix, key = get_library_info(args.library)
+    
+    resp = api_get(f"{prefix}/collections", key, limit=100)
+    collections = resp.json()
+    
+    if not collections:
+        print("No collections found.")
+        return
+    
+    # Build tree structure
+    by_parent = {}
+    for col in collections:
+        data = col.get("data", {})
+        parent = data.get("parentCollection") or "root"
+        if parent not in by_parent:
+            by_parent[parent] = []
+        by_parent[parent].append(data)
+    
+    def print_tree(parent_key, indent=0):
+        for col in sorted(by_parent.get(parent_key, []), key=lambda x: x.get("name", "")):
+            print(f"{'  ' * indent}[{col.get('key')}] {col.get('name')}")
+            print_tree(col.get("key"), indent + 1)
+    
+    print_tree("root")
+
+def cmd_tags(args):
+    """List tags."""
+    prefix, key = get_library_info(args.library)
+    
+    resp = api_get(f"{prefix}/tags", key, limit=100)
+    tags = resp.json()
+    
+    if not tags:
+        print("No tags found.")
+        return
+    
+    for tag in sorted(tags, key=lambda x: x.get("tag", "").lower()):
+        meta = tag.get("meta", {})
+        count = meta.get("numItems", 0)
+        print(f"{tag.get('tag')} ({count})")
+
+def get_or_create_collection(name: str, library: str = "group"):
+    """Get collection key by name, creating if it doesn't exist."""
+    prefix, key = get_library_info(library)
+    
+    # Get all collections
+    resp = api_get(f"{prefix}/collections", key, limit=100)
+    collections = resp.json()
+    
+    # Search for collection by name (case-insensitive)
+    for col in collections:
+        data = col.get("data", {})
+        if data.get("name", "").lower() == name.lower():
+            return data.get("key")
+    
+    # Collection doesn't exist, create it
+    new_collection = {
+        "name": name,
+        "parentCollection": False
+    }
+    
+    resp = api_post(f"{prefix}/collections", key, [new_collection])
+    result = resp.json()
+    
+    if result.get("successful"):
+        success = result.get("successful", {})
+        collection_data = list(success.values())[0]
+        collection_key = collection_data.get("key")
+        print(f"Created collection: {name} [{collection_key}]")
+        return collection_key
+    else:
+        print(f"Failed to create collection: {result}", file=sys.stderr)
+        return None
+
+def add_item_to_collection(item_key: str, collection_key: str, library: str = "group"):
+    """Add an item to a collection."""
+    prefix, key = get_library_info(library)
+    
+    # Get current item data
+    resp = api_get(f"{prefix}/items/{item_key}", key)
+    item_data = resp.json()
+    version = item_data.get("version")
+    current_collections = item_data.get("data", {}).get("collections", [])
+    
+    # Add collection if not already present
+    if collection_key not in current_collections:
+        current_collections.append(collection_key)
+        
+        # Update item
+        headers = {
+            "Zotero-API-Key": key,
+            "Content-Type": "application/json",
+            "If-Unmodified-Since-Version": str(version)
+        }
+        
+        url = f"{API_BASE}{prefix}/items/{item_key}"
+        update_data = {"collections": current_collections}
+        
+        resp = httpx.patch(url, headers=headers, json=update_data, timeout=30)
+        if resp.status_code == 204:
+            return True
+        else:
+            print(f"Failed to add item to collection: {resp.status_code}", file=sys.stderr)
+            return False
+    return True
+
+def cmd_add(args):
+    """Add a new item to the group library."""
+    # Only allow adding to group library
+    if args.library != "group":
+        print("Error: Can only add items to group library", file=sys.stderr)
+        sys.exit(1)
+    
+    prefix, key = get_library_info("group")
+    
+    # Get item template
+    resp = api_get(f"/items/new", key, itemType=args.type)
+    template = resp.json()
+    
+    # Fill in the template
+    template["title"] = args.title
+    
+    if args.authors:
+        creators = []
+        for author in args.authors.split(";"):
+            author = author.strip()
+            if "," in author:
+                last, first = author.split(",", 1)
+                creators.append({
+                    "creatorType": "author",
+                    "lastName": last.strip(),
+                    "firstName": first.strip()
+                })
+            else:
+                creators.append({
+                    "creatorType": "author",
+                    "name": author
+                })
+        template["creators"] = creators
+    
+    if args.url:
+        template["url"] = args.url
+    if args.doi:
+        template["DOI"] = args.doi
+    if args.date:
+        template["date"] = args.date
+    if args.abstract:
+        template["abstractNote"] = args.abstract
+    if args.publication:
+        template["publicationTitle"] = args.publication
+    if args.tags:
+        template["tags"] = [{"tag": t.strip()} for t in args.tags.split(",")]
+    
+    # Create the item
+    resp = api_post(f"{prefix}/items", key, [template])
+    result = resp.json()
+    
+    if result.get("successful") or result.get("success"):
+        success = result.get("successful", result.get("success", {}))
+        item_key = list(success.values())[0] if isinstance(success, dict) and success else None
+        
+        if isinstance(item_key, dict):
+            item_key = item_key.get("key")
+        
+        print(f"Created item: {item_key}")
+        
+        # Add to collection if specified
+        if args.collection and item_key:
+            collection_key = get_or_create_collection(args.collection, args.library)
+            if collection_key:
+                if add_item_to_collection(item_key, collection_key, args.library):
+                    print(f"  → Added to collection: {args.collection}")
+        
+        # Upload PDF if provided (supports local path or URL)
+        # All PDFs get copied/downloaded to zotero-local/ for persistence
+        pdf_filename = None
+        if args.pdf and item_key:
+            pdf_path = args.pdf
+            zotero_dir = ZOTERO_LOCAL_DIR
+            zotero_dir.mkdir(parents=True, exist_ok=True)
+            
+            if pdf_path.startswith("http://") or pdf_path.startswith("https://"):
+                # URL: download to zotero-local
+                pdf_path = str(download_file(pdf_path))
+            else:
+                # Local file: copy to zotero-local for persistence
+                src = Path(pdf_path)
+                if src.exists():
+                    dest = zotero_dir / src.name
+                    if not dest.exists() or dest.resolve() != src.resolve():
+                        shutil.copy2(src, dest)
+                        print(f"Copied to: {dest}")
+                    pdf_path = str(dest)
+            
+            upload_pdf(prefix, key, item_key, pdf_path)
+            pdf_filename = Path(pdf_path).name
+        
+        # Auto-index if we have a PDF (local file to track)
+        if pdf_filename and item_key:
+            index = load_index()
+            index["items"][item_key] = extract_index_metadata(
+                template, "group", pdf_filename
+            )
+            save_index(index)
+            print(f"  → Indexed as [{item_key}]")
+    else:
+        print(f"Failed to create item: {json.dumps(result, indent=2)}", file=sys.stderr)
+        sys.exit(1)
+
+def upload_pdf(prefix: str, api_key: str, parent_key: str, pdf_path: str):
+    """Upload a PDF as a child attachment."""
+    pdf_file = Path(pdf_path)
+    if not pdf_file.exists():
+        print(f"Error: PDF file not found: {pdf_path}", file=sys.stderr)
+        return
+    
+    # Read file and compute MD5
+    content = pdf_file.read_bytes()
+    md5 = hashlib.md5(content).hexdigest()
+    mtime = int(pdf_file.stat().st_mtime * 1000)
+    
+    # Create attachment item
+    attachment = {
+        "itemType": "attachment",
+        "parentItem": parent_key,
+        "linkMode": "imported_file",
+        "title": pdf_file.name,
+        "contentType": "application/pdf",
+        "filename": pdf_file.name,
+        "md5": None,
+        "mtime": None,
+        "tags": [],
+        "relations": {}
+    }
+    
+    resp = api_post(f"{prefix}/items", api_key, [attachment])
+    result = resp.json()
+    
+    success = result.get("successful", result.get("success", {}))
+    if not success:
+        print(f"Failed to create attachment: {json.dumps(result, indent=2)}", file=sys.stderr)
+        return
+    
+    att_key = list(success.values())[0]
+    if isinstance(att_key, dict):
+        att_key = att_key.get("key")
+    
+    # Request upload authorization
+    auth_resp = api_request(
+        "POST",
+        f"{prefix}/items/{att_key}/file",
+        api_key,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "If-None-Match": "*"
+        },
+        data={
+            "md5": md5,
+            "filename": pdf_file.name,
+            "filesize": len(content),
+            "mtime": mtime
+        }
+    )
+    
+    auth = auth_resp.json()
+    
+    if auth.get("exists"):
+        print(f"PDF already exists on server, linked to attachment {att_key}")
+        return
+    
+    # Upload the file
+    upload_url = auth.get("url")
+    upload_prefix = auth.get("prefix", "").encode()
+    upload_suffix = auth.get("suffix", "").encode()
+    content_type = auth.get("contentType")
+    upload_key = auth.get("uploadKey")
+    
+    upload_body = upload_prefix + content + upload_suffix
+    
+    with httpx.Client(timeout=120) as client:
+        up_resp = client.post(
+            upload_url,
+            content=upload_body,
+            headers={"Content-Type": content_type}
+        )
+        
+        if up_resp.status_code not in (200, 201):
+            print(f"Upload failed: {up_resp.status_code} {up_resp.text}", file=sys.stderr)
+            return
+    
+    # Register the upload
+    reg_resp = api_request(
+        "POST",
+        f"{prefix}/items/{att_key}/file",
+        api_key,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "If-None-Match": "*"
+        },
+        data={"upload": upload_key}
+    )
+    
+    if reg_resp.status_code == 204:
+        print(f"Uploaded PDF: {pdf_file.name} -> {att_key}")
+    else:
+        print(f"Failed to register upload: {reg_resp.status_code}", file=sys.stderr)
+
+def download_file(url: str, filename: str = None) -> Path:
+    """Download a file from URL to papers directory. Returns Path to downloaded file."""
+    from urllib.parse import urlparse, unquote
+    
+    # Derive filename from URL if not provided
+    if not filename:
+        parsed = urlparse(url)
+        filename = unquote(Path(parsed.path).name)
+        if not filename or not filename.endswith('.pdf'):
+            filename = "downloaded.pdf"
+    
+    # Use persistent zotero-local directory
+    zotero_dir = ZOTERO_LOCAL_DIR
+    zotero_dir.mkdir(parents=True, exist_ok=True)
+    output_path = zotero_dir / filename
+    
+    # Skip download if file already exists
+    if output_path.exists():
+        print(f"Already downloaded: {output_path}")
+        return output_path
+    
+    print(f"Downloading {url}...")
+    
+    with httpx.Client(timeout=120, follow_redirects=True) as client:
+        resp = client.get(url)
+        
+        if resp.status_code != 200:
+            print(f"Error: Failed to download ({resp.status_code})", file=sys.stderr)
+            sys.exit(1)
+        
+        output_path.write_bytes(resp.content)
+    
+    print(f"Downloaded: {output_path.name} ({len(resp.content) // 1024}KB)")
+    return output_path
+
+def cmd_attach(args):
+    """Attach a PDF to an existing item in the group library."""
+    # Only allow attaching to group library
+    if args.library != "group":
+        print("Error: Can only attach files to group library", file=sys.stderr)
+        sys.exit(1)
+    
+    prefix, api_key = get_library_info("group")
+    
+    # Get PDF path - either from local file or URL
+    # All PDFs get copied/downloaded to zotero-local/ for persistence
+    zotero_dir = ZOTERO_LOCAL_DIR
+    zotero_dir.mkdir(parents=True, exist_ok=True)
+    
+    if args.url:
+        pdf_path = download_file(args.url, args.filename)
+    elif args.file:
+        src_path = Path(args.file)
+        if not src_path.exists():
+            print(f"Error: File not found: {args.file}", file=sys.stderr)
+            sys.exit(1)
+        # Copy to zotero-local/ for persistence
+        dest_name = args.filename if args.filename else src_path.name
+        pdf_path = zotero_dir / dest_name
+        if not pdf_path.exists() or pdf_path.resolve() != src_path.resolve():
+            shutil.copy2(src_path, pdf_path)
+            print(f"Copied to: {pdf_path}")
+        else:
+            print(f"Using: {pdf_path}")
+    else:
+        print("Error: Provide either a file path or --url", file=sys.stderr)
+        sys.exit(1)
+    
+    # Verify the parent item exists and get its data
+    try:
+        resp = api_get(f"{prefix}/items/{args.key}", api_key)
+        item = resp.json()
+        item_data = item.get("data", {})
+        title = item_data.get("title", "(unknown)")
+        print(f"Attaching to: {title}")
+    except:
+        print(f"Error: Item {args.key} not found in group library", file=sys.stderr)
+        sys.exit(1)
+    
+    # Upload the PDF
+    upload_pdf(prefix, api_key, args.key, str(pdf_path))
+    
+    # Auto-index with full metadata
+    index = load_index()
+    index["items"][args.key] = extract_index_metadata(
+        item_data, "group", Path(pdf_path).name
+    )
+    save_index(index)
+    print(f"  → Indexed as [{args.key}]")
+
+def cmd_cite(args):
+    """Get formatted citation."""
+    prefix, key = get_library_info(args.library)
+    
+    style_map = {
+        "apa": "apa",
+        "chicago": "chicago-note-bibliography",
+        "mla": "modern-language-association",
+        "harvard": "harvard-cite-them-right",
+        "ieee": "ieee",
+        "bibtex": None  # handled separately
+    }
+    
+    if args.style == "bibtex":
+        resp = api_get(f"{prefix}/items/{args.key}", key, format="bibtex")
+        print(resp.text)
+    else:
+        style = style_map.get(args.style, args.style)
+        resp = api_get(f"{prefix}/items/{args.key}", key, format="json", include="bib", style=style)
+        item = resp.json()
+        print(item.get("bib", "Citation not available"))
+
+def cmd_recent(args):
+    """List recently modified items."""
+    prefix, key = get_library_info(args.library)
+    
+    resp = api_get(f"{prefix}/items", key,
+                   limit=args.limit,
+                   sort="dateModified",
+                   direction="desc")
+    
+    items = resp.json()
+    
+    for item in items:
+        data = item.get("data", {})
+        if data.get("itemType") == "attachment":
+            continue
+        
+        key = data.get("key", "?")
+        title = data.get("title", "(no title)")[:60]
+        modified = data.get("dateModified", "?")[:10]
+        
+        creators = data.get("creators", [])
+        if creators:
+            author = creators[0].get("lastName") or creators[0].get("name", "?")
+        else:
+            author = "?"
+        
+        print(f"[{key}] {modified} | {author}: {title}")
+
+def cmd_export(args):
+    """Export item in specified format."""
+    prefix, key = get_library_info(args.library)
+    
+    format_map = {
+        "bibtex": "bibtex",
+        "ris": "ris",
+        "csljson": "csljson",
+        "mods": "mods",
+        "tei": "tei"
+    }
+    
+    fmt = format_map.get(args.format, args.format)
+    resp = api_get(f"{prefix}/items/{args.key}", key, format=fmt)
+    print(resp.text)
+
+def html_to_markdown(html: str) -> str:
+    """Convert simple HTML to markdown for local storage."""
+    import re
+    text = html
+    # Headers
+    text = re.sub(r'<h1[^>]*>(.*?)</h1>', r'# \1\n', text, flags=re.IGNORECASE|re.DOTALL)
+    text = re.sub(r'<h2[^>]*>(.*?)</h2>', r'## \1\n', text, flags=re.IGNORECASE|re.DOTALL)
+    text = re.sub(r'<h3[^>]*>(.*?)</h3>', r'### \1\n', text, flags=re.IGNORECASE|re.DOTALL)
+    # Lists
+    text = re.sub(r'<li[^>]*>(.*?)</li>', r'- \1\n', text, flags=re.IGNORECASE|re.DOTALL)
+    text = re.sub(r'</?[uo]l[^>]*>', '', text, flags=re.IGNORECASE)
+    # Paragraphs and breaks
+    text = re.sub(r'<p[^>]*>(.*?)</p>', r'\1\n\n', text, flags=re.IGNORECASE|re.DOTALL)
+    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
+    # Bold/italic
+    text = re.sub(r'<strong[^>]*>(.*?)</strong>', r'**\1**', text, flags=re.IGNORECASE|re.DOTALL)
+    text = re.sub(r'<b[^>]*>(.*?)</b>', r'**\1**', text, flags=re.IGNORECASE|re.DOTALL)
+    text = re.sub(r'<em[^>]*>(.*?)</em>', r'*\1*', text, flags=re.IGNORECASE|re.DOTALL)
+    text = re.sub(r'<i[^>]*>(.*?)</i>', r'*\1*', text, flags=re.IGNORECASE|re.DOTALL)
+    # Strip remaining tags
+    text = re.sub(r'<[^>]+>', '', text)
+    # Clean up whitespace
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+def save_note_locally(item_key: str, note_key: str, content: str, parent_title: str, tags: list = None):
+    """Save note as local markdown file."""
+    from datetime import datetime
+    
+    notes_dir = ZOTERO_LOCAL_DIR / "notes" / item_key
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Convert HTML to markdown
+    md_content = html_to_markdown(content)
+    
+    # Build markdown file with YAML front matter
+    tags_str = ", ".join(tags) if tags else ""
+    note_file = notes_dir / f"{note_key}.md"
+    
+    with open(note_file, "w") as f:
+        f.write(f"---\n")
+        f.write(f"item: {item_key}\n")
+        f.write(f"note: {note_key}\n")
+        f.write(f"title: \"{parent_title}\"\n")
+        f.write(f"date: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
+        if tags_str:
+            f.write(f"tags: [{tags_str}]\n")
+        f.write(f"---\n\n")
+        f.write(md_content)
+    
+    return note_file
+
+def cmd_note(args):
+    """Add a note to an item (group library only)."""
+    if args.library != "group":
+        print("Error: Can only add notes to group library", file=sys.stderr)
+        sys.exit(1)
+    
+    prefix, api_key = get_library_info("group")
+    
+    # Verify parent item exists and get its title
+    resp = api_get(f"{prefix}/items/{args.key}", api_key)
+    item = resp.json()
+    parent_title = item.get("data", {}).get("title", "(unknown)")
+    
+    # Read note content from file or argument
+    if args.file:
+        with open(args.file, "r") as f:
+            content = f.read()
+    elif args.content:
+        content = args.content
+    else:
+        print("Error: Provide note content via --content or --file", file=sys.stderr)
+        sys.exit(1)
+    
+    # Create note item
+    note_data = {
+        "itemType": "note",
+        "parentItem": args.key,
+        "note": content,
+        "tags": []
+    }
+    
+    tag_list = []
+    if args.tags:
+        tag_list = [t.strip() for t in args.tags.split(",")]
+        note_data["tags"] = [{"tag": t} for t in tag_list]
+    
+    resp = api_post(f"{prefix}/items", api_key, [note_data])
+    
+    if resp.status_code in (200, 201):
+        result = resp.json()
+        if result.get("successful"):
+            note_key = list(result["successful"].values())[0]["key"]
+            print(f"✓ Note added to '{parent_title}'")
+            print(f"  Note key: {note_key}")
+            
+            # Save locally as markdown
+            local_path = save_note_locally(args.key, note_key, content, parent_title, tag_list)
+            print(f"  Local: {local_path}")
+        else:
+            print(f"Error: {result.get('failed', result)}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        print(f"Error {resp.status_code}: {resp.text}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_notes(args):
+    """List notes attached to an item."""
+    prefix, api_key = get_library_info(args.library)
+    
+    resp = api_get(f"{prefix}/items/{args.key}/children", api_key)
+    children = resp.json()
+    
+    notes = [c for c in children if c.get("data", {}).get("itemType") == "note"]
+    
+    if not notes:
+        print("No notes found for this item.")
+        return
+    
+    for note in notes:
+        data = note.get("data", {})
+        key = data.get("key")
+        content = data.get("note", "")
+        # Strip HTML tags for preview
+        import re
+        text = re.sub(r'<[^>]+>', '', content)
+        preview = text[:100] + "..." if len(text) > 100 else text
+        print(f"[{key}] {preview}")
+
+def cmd_annotations(args):
+    """List annotations on a PDF attachment."""
+    prefix, api_key = get_library_info(args.library)
+    
+    # First, check if the key is an item or attachment
+    # Get children - if this is the parent item, we need to find PDF attachments first
+    resp = api_get(f"{prefix}/items/{args.key}", api_key)
+    item = resp.json()
+    item_type = item.get("data", {}).get("itemType")
+    
+    if item_type == "attachment":
+        # Key is already a PDF attachment, get its annotations directly
+        attachment_key = args.key
+        attachment_keys = [attachment_key]
+    else:
+        # Key is a parent item, find PDF attachments
+        resp = api_get(f"{prefix}/items/{args.key}/children", api_key)
+        children = resp.json()
+        attachment_keys = [
+            c["data"]["key"] for c in children 
+            if c.get("data", {}).get("itemType") == "attachment" 
+            and c.get("data", {}).get("contentType") == "application/pdf"
+        ]
+        
+        if not attachment_keys:
+            print("No PDF attachments found for this item.")
+            return
+    
+    # Get annotations for each PDF attachment
+    all_annotations = []
+    for att_key in attachment_keys:
+        resp = api_get(f"{prefix}/items/{att_key}/children", api_key)
+        children = resp.json()
+        annotations = [c for c in children if c.get("data", {}).get("itemType") == "annotation"]
+        for ann in annotations:
+            ann["_attachment_key"] = att_key
+        all_annotations.extend(annotations)
+    
+    if not all_annotations:
+        print("No annotations found.")
+        return
+    
+    # Group by page
+    by_page = {}
+    for ann in all_annotations:
+        data = ann.get("data", {})
+        page = data.get("annotationPageLabel", "?")
+        if page not in by_page:
+            by_page[page] = []
+        by_page[page].append(data)
+    
+    # Output format
+    if args.format == "json":
+        output = []
+        for ann in all_annotations:
+            data = ann.get("data", {})
+            output.append({
+                "key": data.get("key"),
+                "type": data.get("annotationType"),
+                "page": data.get("annotationPageLabel"),
+                "text": data.get("annotationText"),
+                "comment": data.get("annotationComment"),
+                "color": data.get("annotationColor"),
+                "tags": [t.get("tag") for t in data.get("tags", [])],
+            })
+        print(json.dumps(output, indent=2))
+    else:
+        # Human-readable format
+        for page in sorted(by_page.keys(), key=lambda x: int(x) if x.isdigit() else 999):
+            print(f"\n=== Page {page} ===")
+            for data in by_page[page]:
+                ann_type = data.get("annotationType", "unknown")
+                text = data.get("annotationText", "")
+                comment = data.get("annotationComment", "")
+                color = data.get("annotationColor", "")
+                
+                type_icon = {
+                    "highlight": "🖍️",
+                    "note": "📝",
+                    "text": "💬",
+                    "image": "🖼️",
+                    "ink": "✏️",
+                }.get(ann_type, "•")
+                
+                print(f"\n{type_icon} [{ann_type}]", end="")
+                if color:
+                    print(f" ({color})", end="")
+                print()
+                
+                if text:
+                    # Wrap long text
+                    if len(text) > 200 and not args.full:
+                        print(f"   \"{text[:200]}...\"")
+                    else:
+                        print(f"   \"{text}\"")
+                
+                if comment:
+                    print(f"   → {comment}")
+
+def cmd_render(args):
+    """Render markdown note to PDF and attach to Zotero item."""
+    import subprocess
+    
+    # Verify input file exists
+    input_path = Path(args.input)
+    if not input_path.exists():
+        print(f"Error: Input file not found: {args.input}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Get group library info (we attach to group library)
+    prefix, api_key = get_library_info("group")
+    
+    # Verify the item exists and get its title
+    try:
+        resp = api_get(f"{prefix}/items/{args.key}", api_key)
+        item = resp.json()
+        item_data = item.get("data", {})
+        parent_title = item_data.get("title", "(unknown)")
+        print(f"Rendering note for: {parent_title}")
+    except Exception as e:
+        print(f"Error: Item {args.key} not found in group library", file=sys.stderr)
+        sys.exit(1)
+    
+    # Create output directory
+    note_pdfs_dir = ZOTERO_LOCAL_DIR / "note-pdfs" / args.key
+    note_pdfs_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Determine output filename
+    output_name = args.output if args.output else input_path.stem + ".pdf"
+    if not output_name.endswith(".pdf"):
+        output_name += ".pdf"
+    output_path = note_pdfs_dir / output_name
+    
+    # Build Pandoc command (uses default Pandoc template with lmodern fonts)
+    pandoc_cmd = [
+        "pandoc",
+        str(input_path),
+        "-o", str(output_path),
+        "--pdf-engine=pdflatex",
+        "-V", "geometry:margin=1in",  # Reasonable margins (default is huge)
+    ]
+    
+    print(f"Running: pandoc {input_path.name} → {output_name}")
+    
+    # Run Pandoc
+    result = subprocess.run(pandoc_cmd, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        print(f"Error: Pandoc failed:", file=sys.stderr)
+        print(result.stderr, file=sys.stderr)
+        sys.exit(1)
+    
+    print(f"✓ PDF created: {output_path}")
+    
+    # Optionally generate .tex file
+    if args.keep_tex:
+        tex_name = output_name.replace(".pdf", ".tex")
+        tex_path = note_pdfs_dir / tex_name
+        tex_cmd = [
+            "pandoc",
+            str(input_path),
+            "-o", str(tex_path),
+            "-s",  # Standalone (full LaTeX document)
+        ]
+        result_tex = subprocess.run(tex_cmd, capture_output=True, text=True)
+        if result_tex.returncode == 0:
+            print(f"✓ LaTeX saved: {tex_path}")
+        else:
+            print(f"Warning: Failed to generate .tex file", file=sys.stderr)
+    
+    # Attach to Zotero (default behavior)
+    if not args.no_attach:
+        print(f"Attaching to Zotero item [{args.key}]...")
+        upload_pdf(prefix, api_key, args.key, str(output_path))
+    else:
+        print("(Skipping Zotero attachment per --no-attach)")
+
+
+def cmd_index(args):
+    """Manage local PDF index (tracks Zotero key ↔ local filename ↔ title)."""
+    index = load_index()
+    
+    if args.action == "list":
+        if not index["items"]:
+            print("Index is empty. Download PDFs with 'zot pdf' to populate.")
+            return
+        print(f"{'Key':<12} {'Filename':<40} Title")
+        print("-" * 80)
+        for key, info in sorted(index["items"].items()):
+            fname = info.get("filename", "?")[:38]
+            title = info.get("title", "?")[:40]
+            print(f"{key:<12} {fname:<40} {title}")
+    
+    elif args.action == "add":
+        if not args.key or not args.filename:
+            print("Error: --key and --filename required for add", file=sys.stderr)
+            sys.exit(1)
+        
+        library = args.library or "personal"
+        
+        # Fetch full item details from Zotero
+        try:
+            prefix, api_key = get_library_info(library)
+            resp = api_get(f"{prefix}/items/{args.key}", api_key)
+            item = resp.json()
+            item_data = item.get("data", {})
+            entry = extract_index_metadata(item_data, library, args.filename)
+            
+            # Resolve collection names if group library
+            if library == "group" and entry.get("collections"):
+                collection_names = fetch_collection_names(prefix, api_key)
+                entry["collections"] = [collection_names.get(c, c) for c in entry["collections"]]
+        except Exception as e:
+            # Fallback to minimal entry
+            entry = {
+                "filename": args.filename,
+                "title": args.title or "(unknown)",
+                "library": library
+            }
+        
+        index["items"][args.key] = entry
+        save_index(index)
+        print(f"✓ Indexed: {args.key} → {args.filename}")
+        print(f"    Title: {entry.get('title', '?')}")
+    
+    elif args.action == "remove":
+        if args.key in index["items"]:
+            del index["items"][args.key]
+            save_index(index)
+            print(f"✓ Removed {args.key} from index")
+        else:
+            print(f"Key {args.key} not in index")
+    
+    elif args.action == "find":
+        query = args.query.lower() if args.query else ""
+        found = False
+        for key, info in index["items"].items():
+            # Search across all text fields
+            searchable = [
+                key.lower(),
+                info.get("filename", "").lower(),
+                info.get("title", "").lower(),
+                info.get("publication", "").lower() if info.get("publication") else "",
+                info.get("doi", "").lower() if info.get("doi") else "",
+                info.get("itemType", "").lower() if info.get("itemType") else "",
+                info.get("year", "") if info.get("year") else "",
+            ]
+            # Add authors
+            for author in info.get("authors", []):
+                searchable.append(author.lower())
+            # Add tags
+            for tag in info.get("tags", []):
+                searchable.append(tag.lower())
+            
+            if any(query in field for field in searchable):
+                authors_str = ", ".join(info.get("authors", []))[:30]
+                year = info.get("year", "?")
+                print(f"[{key}] {authors_str} ({year})")
+                print(f"    {info.get('title', '?')}")
+                if info.get("filename"):
+                    print(f"    File: {info.get('filename')}")
+                if info.get("tags"):
+                    print(f"    Tags: {', '.join(info.get('tags', []))}")
+                print()
+                found = True
+        if not found:
+            print("No matches found.")
+    
+    elif args.action == "sync":
+        # Full reconciliation with group library
+        print("Syncing index with group library...")
+        
+        try:
+            prefix, api_key = get_library_info("group")
+        except SystemExit:
+            print("Error: Group library credentials required for sync", file=sys.stderr)
+            sys.exit(1)
+        
+        # Fetch all items from group library (filter out attachments and notes)
+        resp = api_get(f"{prefix}/items", api_key, limit=100)
+        all_items = resp.json()
+        library_items = [
+            item for item in all_items 
+            if item.get("data", {}).get("itemType") not in ("attachment", "note")
+        ]
+        library_keys = {item["data"]["key"]: item["data"] for item in library_items}
+        
+        # Fetch collection names for resolving collection keys
+        collection_names = fetch_collection_names(prefix, api_key)
+        
+        removed = 0
+        updated = 0
+        
+        # Check each index entry with library="group"
+        keys_to_remove = []
+        for key, info in index["items"].items():
+            if info.get("library") != "group":
+                continue
+            
+            if key not in library_keys:
+                # Item was deleted from library
+                keys_to_remove.append(key)
+                print(f"  - Removing: {info.get('title', key)[:50]} (deleted from library)")
+                removed += 1
+            else:
+                # Update metadata if changed
+                lib_data = library_keys[key]
+                new_meta = extract_index_metadata(lib_data, "group", info.get("filename"))
+                
+                # Resolve collection names
+                if new_meta.get("collections"):
+                    new_meta["collections"] = [
+                        collection_names.get(c, c) for c in new_meta["collections"]
+                    ]
+                
+                # Check if anything changed (compare relevant fields)
+                changed = False
+                for field in ["title", "authors", "year", "tags", "doi", "publication", "collections"]:
+                    if info.get(field) != new_meta.get(field):
+                        changed = True
+                        break
+                
+                if changed:
+                    # Preserve filename from existing entry
+                    if info.get("filename"):
+                        new_meta["filename"] = info["filename"]
+                    index["items"][key] = new_meta
+                    print(f"  ~ Updated: {new_meta.get('title', key)[:50]}")
+                    updated += 1
+        
+        # Remove deleted items
+        for key in keys_to_remove:
+            del index["items"][key]
+        
+        # Check for unindexed local PDFs
+        zotero_dir = ZOTERO_LOCAL_DIR
+        if zotero_dir.exists():
+            pdfs = list(zotero_dir.glob("*.pdf"))
+            indexed_files = {info.get("filename") for info in index["items"].values() if info.get("filename")}
+            unindexed = [p for p in pdfs if p.name not in indexed_files]
+        else:
+            unindexed = []
+        
+        save_index(index)
+        
+        print(f"\nSync complete:")
+        print(f"  Removed: {removed}")
+        print(f"  Updated: {updated}")
+        print(f"  Total indexed: {len(index['items'])}")
+        if unindexed:
+            print(f"  Unindexed PDFs: {len(unindexed)}")
+            for p in unindexed[:5]:
+                print(f"    - {p.name}")
+            if len(unindexed) > 5:
+                print(f"    ... and {len(unindexed) - 5} more")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Zotero CLI for querying and managing research libraries",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__
+    )
+    
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    
+    # search
+    p_search = subparsers.add_parser("search", help="Search for items")
+    p_search.add_argument("query", help="Search query")
+    p_search.add_argument("--library", "-l", choices=["personal", "group"], default="personal")
+    p_search.add_argument("--limit", "-n", type=int, default=20)
+    p_search.add_argument("--verbose", "-v", action="store_true")
+    p_search.add_argument("--fulltext", "-f", action="store_true", help="Search full-text content (PDFs)")
+    
+    # item
+    p_item = subparsers.add_parser("item", help="Get item details")
+    p_item.add_argument("key", help="Item key")
+    p_item.add_argument("--library", "-l", choices=["personal", "group"], default="personal")
+    
+    # pdf
+    p_pdf = subparsers.add_parser("pdf", help="Download PDF attachment")
+    p_pdf.add_argument("key", help="Item or attachment key")
+    p_pdf.add_argument("--library", "-l", choices=["personal", "group"], default="personal")
+    p_pdf.add_argument("-o", "--output", help="Output filename")
+    
+    # collections
+    p_cols = subparsers.add_parser("collections", help="List collections")
+    p_cols.add_argument("--library", "-l", choices=["personal", "group"], default="personal")
+    
+    # tags
+    p_tags = subparsers.add_parser("tags", help="List tags")
+    p_tags.add_argument("--library", "-l", choices=["personal", "group"], default="personal")
+    
+    # add
+    p_add = subparsers.add_parser("add", help="Add item to group library")
+    p_add.add_argument("title", help="Item title")
+    p_add.add_argument("--type", "-t", default="journalArticle", help="Item type")
+    p_add.add_argument("--authors", "-a", help="Authors: 'Last, First; Last, First'")
+    p_add.add_argument("--pdf", "-p", help="PDF file to attach")
+    p_add.add_argument("--url", help="URL")
+    p_add.add_argument("--doi", help="DOI")
+    p_add.add_argument("--date", help="Publication date")
+    p_add.add_argument("--abstract", help="Abstract")
+    p_add.add_argument("--publication", help="Publication/journal name")
+    p_add.add_argument("--tags", help="Tags (comma-separated)")
+    p_add.add_argument("--collection", "-c", help="Collection name (created if doesn't exist)")
+    p_add.add_argument("--library", "-l", choices=["personal", "group"], default="group")
+    
+    # cite
+    p_cite = subparsers.add_parser("cite", help="Get formatted citation")
+    p_cite.add_argument("key", help="Item key")
+    p_cite.add_argument("--style", "-s", default="apa", help="Citation style")
+    p_cite.add_argument("--library", "-l", choices=["personal", "group"], default="personal")
+    
+    # recent
+    p_recent = subparsers.add_parser("recent", help="List recently modified items")
+    p_recent.add_argument("--library", "-l", choices=["personal", "group"], default="personal")
+    p_recent.add_argument("--limit", "-n", type=int, default=10)
+    
+    # export
+    p_export = subparsers.add_parser("export", help="Export item")
+    p_export.add_argument("key", help="Item key")
+    p_export.add_argument("--format", "-f", default="bibtex", help="Export format")
+    p_export.add_argument("--library", "-l", choices=["personal", "group"], default="personal")
+    
+    # attach
+    p_attach = subparsers.add_parser("attach", help="Attach PDF to existing item (group library only)")
+    p_attach.add_argument("key", help="Item key to attach PDF to")
+    p_attach.add_argument("file", nargs="?", help="Local PDF file path")
+    p_attach.add_argument("--url", "-u", help="Download PDF from URL instead of local file")
+    p_attach.add_argument("--filename", help="Override filename (for URL downloads)")
+    p_attach.add_argument("--library", "-l", choices=["personal", "group"], default="group")
+    
+    # note (add note to item)
+    p_note = subparsers.add_parser("note", help="Add a note to an item (group library only)")
+    p_note.add_argument("key", help="Item key to add note to")
+    p_note.add_argument("--content", "-c", help="Note content (HTML or plain text)")
+    p_note.add_argument("--file", "-f", help="Read note content from file")
+    p_note.add_argument("--tags", "-t", help="Tags (comma-separated)")
+    p_note.add_argument("--library", "-l", choices=["personal", "group"], default="group")
+    
+    # notes (list notes)
+    p_notes = subparsers.add_parser("notes", help="List notes attached to an item")
+    p_notes.add_argument("key", help="Item key")
+    p_notes.add_argument("--library", "-l", choices=["personal", "group"], default="personal")
+    
+    # annotations (list PDF annotations)
+    p_ann = subparsers.add_parser("annotations", help="List annotations on PDF attachments")
+    p_ann.add_argument("key", help="Item key (parent item or PDF attachment)")
+    p_ann.add_argument("--library", "-l", choices=["personal", "group"], default="personal")
+    p_ann.add_argument("--format", "-f", choices=["text", "json"], default="text", help="Output format")
+    p_ann.add_argument("--full", action="store_true", help="Show full text (don't truncate)")
+    
+    # index (local tracking)
+    p_index = subparsers.add_parser("index", help="Manage local PDF index")
+    p_index.add_argument("action", choices=["list", "add", "remove", "find", "sync"],
+                         help="list: show all; add: add entry; remove: delete entry; find: search; sync: check unindexed")
+    p_index.add_argument("--key", "-k", help="Zotero item key")
+    p_index.add_argument("--filename", help="Local filename")
+    p_index.add_argument("--title", help="Paper title (auto-fetched if omitted)")
+    p_index.add_argument("--query", "-q", help="Search query (for find)")
+    p_index.add_argument("--library", "-l", choices=["personal", "group"], default="personal")
+    
+    # render (markdown → PDF, attach to Zotero)
+    p_render = subparsers.add_parser("render", help="Render markdown note to PDF and attach to Zotero item")
+    p_render.add_argument("key", help="Zotero item key to attach PDF to")
+    p_render.add_argument("input", help="Input markdown file")
+    p_render.add_argument("-o", "--output", help="Output PDF filename (default: input name + .pdf)")
+    p_render.add_argument("--no-attach", action="store_true", help="Don't upload to Zotero, just create local PDF")
+    p_render.add_argument("--keep-tex", action="store_true", help="Also save intermediate .tex file")
+    
+    args = parser.parse_args()
+    
+    commands = {
+        "search": cmd_search,
+        "item": cmd_item,
+        "pdf": cmd_pdf,
+        "collections": cmd_collections,
+        "tags": cmd_tags,
+        "add": cmd_add,
+        "attach": cmd_attach,
+        "note": cmd_note,
+        "notes": cmd_notes,
+        "annotations": cmd_annotations,
+        "cite": cmd_cite,
+        "recent": cmd_recent,
+        "export": cmd_export,
+        "index": cmd_index,
+        "render": cmd_render,
+    }
+    
+    commands[args.command](args)
+
+if __name__ == "__main__":
+    main()

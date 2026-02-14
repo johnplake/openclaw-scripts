@@ -1,0 +1,233 @@
+#!/bin/bash
+# Bluesky CLI helper for John P. Lake
+
+CONFIG="$HOME/.config/bsky/config.json"
+PDS="https://bsky.social"
+
+# Read config
+IDENTIFIER=$(cat "$CONFIG" | grep -o '"identifier": *"[^"]*"' | cut -d'"' -f4)
+PASSWORD=$(cat "$CONFIG" | grep -o '"password": *"[^"]*"' | cut -d'"' -f4)
+DID=$(cat "$CONFIG" | grep -o '"did": *"[^"]*"' | cut -d'"' -f4)
+
+# Get fresh session token
+get_session() {
+    curl -s -X POST "$PDS/xrpc/com.atproto.server.createSession" \
+        -H "Content-Type: application/json" \
+        -d "{\"identifier\": \"$IDENTIFIER\", \"password\": \"$PASSWORD\"}"
+}
+
+get_token() {
+    get_session | grep -o '"accessJwt":"[^"]*"' | cut -d'"' -f4
+}
+
+get_did() {
+    get_session | grep -o '"did":"[^"]*"' | cut -d'"' -f4
+}
+
+# Post a skeet (supports --reply-to for replies)
+post() {
+    local text=""
+    local reply_to=""
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --reply-to)
+                reply_to="$2"
+                shift 2
+                ;;
+            *)
+                if [[ -z "$text" ]]; then
+                    text="$1"
+                else
+                    text="$text $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    local token=$(get_token)
+    local did=$(get_did)
+    local now=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
+    
+    # Build the record JSON
+    local record="{
+        \"\$type\": \"app.bsky.feed.post\",
+        \"text\": \"$text\",
+        \"createdAt\": \"$now\""
+    
+    # Add reply reference if provided
+    if [[ -n "$reply_to" ]]; then
+        # Get the parent post to extract cid
+        local parent_info=$(curl -s "$PDS/xrpc/com.atproto.repo.getRecord?repo=${reply_to#at://}" | head -c 1000)
+        local parent_cid=$(echo "$parent_info" | grep -o '"cid":"[^"]*"' | head -1 | cut -d'"' -f4)
+        
+        # For simplicity, use parent as both root and parent (works for direct replies)
+        record="$record,
+        \"reply\": {
+            \"root\": {\"uri\": \"$reply_to\", \"cid\": \"$parent_cid\"},
+            \"parent\": {\"uri\": \"$reply_to\", \"cid\": \"$parent_cid\"}
+        }"
+    fi
+    
+    record="$record
+    }"
+    
+    curl -s -X POST "$PDS/xrpc/com.atproto.repo.createRecord" \
+        -H "Authorization: Bearer $token" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"repo\": \"$did\",
+            \"collection\": \"app.bsky.feed.post\",
+            \"record\": $record
+        }"
+}
+
+# Like a post (requires uri and cid)
+like() {
+    local uri="$1"
+    local cid="$2"
+    local token=$(get_token)
+    local did=$(get_did)
+    local now=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
+    
+    curl -s -X POST "$PDS/xrpc/com.atproto.repo.createRecord" \
+        -H "Authorization: Bearer $token" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"repo\": \"$did\",
+            \"collection\": \"app.bsky.feed.like\",
+            \"record\": {
+                \"\$type\": \"app.bsky.feed.like\",
+                \"subject\": {\"uri\": \"$uri\", \"cid\": \"$cid\"},
+                \"createdAt\": \"$now\"
+            }
+        }"
+}
+
+# Follow a user (requires their DID)
+follow() {
+    local subject_did="$1"
+    local token=$(get_token)
+    local did=$(get_did)
+    local now=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
+    
+    curl -s -X POST "$PDS/xrpc/com.atproto.repo.createRecord" \
+        -H "Authorization: Bearer $token" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"repo\": \"$did\",
+            \"collection\": \"app.bsky.graph.follow\",
+            \"record\": {
+                \"\$type\": \"app.bsky.graph.follow\",
+                \"subject\": \"$subject_did\",
+                \"createdAt\": \"$now\"
+            }
+        }"
+}
+
+# Repost (requires uri and cid)
+repost() {
+    local uri="$1"
+    local cid="$2"
+    local token=$(get_token)
+    local did=$(get_did)
+    local now=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
+    
+    curl -s -X POST "$PDS/xrpc/com.atproto.repo.createRecord" \
+        -H "Authorization: Bearer $token" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"repo\": \"$did\",
+            \"collection\": \"app.bsky.feed.repost\",
+            \"record\": {
+                \"\$type\": \"app.bsky.feed.repost\",
+                \"subject\": {\"uri\": \"$uri\", \"cid\": \"$cid\"},
+                \"createdAt\": \"$now\"
+            }
+        }"
+}
+
+# Get timeline
+timeline() {
+    local limit="${1:-10}"
+    local token=$(get_token)
+    
+    curl -s "$PDS/xrpc/app.bsky.feed.getTimeline?limit=$limit" \
+        -H "Authorization: Bearer $token"
+}
+
+# Get profile
+profile() {
+    local actor="${1:-$IDENTIFIER}"
+    local token=$(get_token)
+    
+    curl -s "$PDS/xrpc/app.bsky.actor.getProfile?actor=$actor" \
+        -H "Authorization: Bearer $token"
+}
+
+# Get notifications
+notifications() {
+    local limit="${1:-10}"
+    local token=$(get_token)
+    
+    curl -s "$PDS/xrpc/app.bsky.notification.listNotifications?limit=$limit" \
+        -H "Authorization: Bearer $token"
+}
+
+# Search posts
+search() {
+    local query="$1"
+    local limit="${2:-10}"
+    local token=$(get_token)
+    
+    curl -s "$PDS/xrpc/app.bsky.feed.searchPosts?q=$(echo "$query" | jq -sRr @uri)&limit=$limit" \
+        -H "Authorization: Bearer $token"
+}
+
+case "$1" in
+    post)
+        shift
+        post "$@"
+        ;;
+    like)
+        like "$2" "$3"
+        ;;
+    follow)
+        follow "$2"
+        ;;
+    repost)
+        repost "$2" "$3"
+        ;;
+    timeline|tl)
+        timeline "$2"
+        ;;
+    profile)
+        profile "$2"
+        ;;
+    notifications|notifs)
+        notifications "$2"
+        ;;
+    search)
+        shift
+        search "$*"
+        ;;
+    token)
+        get_token
+        ;;
+    *)
+        echo "Usage: bsky <command> [args]"
+        echo "Commands:"
+        echo "  post <text>           - Post a skeet"
+        echo "  post <text> --reply-to <uri> - Reply to a post"
+        echo "  like <uri> <cid>      - Like a post"
+        echo "  follow <did>          - Follow a user"
+        echo "  repost <uri> <cid>    - Repost"
+        echo "  timeline [n]          - Get timeline (default 10)"
+        echo "  profile [handle]      - Get profile"
+        echo "  notifications [n]     - Get notifications"
+        echo "  search <query> [n]    - Search posts"
+        echo "  token                 - Get fresh session token"
+        ;;
+esac
