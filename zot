@@ -1410,12 +1410,12 @@ def cmd_copy(args):
             print(f"  Creating {len(annotations)} annotation(s)...")
             
             for ann in annotations:
+                ann_type = ann.get("annotationType")
                 # Build annotation item for target
                 new_ann = {
                     "itemType": "annotation",
                     "parentItem": new_pdf_key,
-                    "annotationType": ann.get("annotationType"),
-                    "annotationText": ann.get("annotationText", ""),
+                    "annotationType": ann_type,
                     "annotationComment": ann.get("annotationComment", ""),
                     "annotationColor": ann.get("annotationColor", "#ffd400"),
                     "annotationPageLabel": ann.get("annotationPageLabel", ""),
@@ -1423,6 +1423,9 @@ def cmd_copy(args):
                     "annotationPosition": ann.get("annotationPosition", "{}"),
                     "tags": ann.get("tags", []),
                 }
+                # annotationText only allowed for highlight/underline
+                if ann_type in ("highlight", "underline"):
+                    new_ann["annotationText"] = ann.get("annotationText", "")
                 
                 resp = api_post(f"{tgt_prefix}/items", tgt_key, [new_ann])
                 result = resp.json()
