@@ -42,6 +42,10 @@ import httpx
 
 API_BASE = "https://api.zotero.org"
 
+# Maximum items per API request (Zotero API hard limit is 100)
+# For items with >100 children/annotations, pagination would be needed
+API_FETCH_LIMIT = 100
+
 # Local storage directory (PDFs, index, notes)
 # Override with ZOTERO_LOCAL_DIR env var for per-agent isolation
 ZOTERO_LOCAL_DIR = Path(os.environ.get(
@@ -169,7 +173,7 @@ def extract_index_metadata(data: dict, library: str, filename: str = None) -> di
 
 def fetch_collection_names(prefix: str, api_key: str) -> dict:
     """Fetch all collections and return key -> name mapping."""
-    resp = api_get(f"{prefix}/collections", api_key, limit=100)
+    resp = api_get(f"{prefix}/collections", api_key, limit=API_FETCH_LIMIT)
     collections = resp.json()
     return {c["data"]["key"]: c["data"]["name"] for c in collections}
 
@@ -272,7 +276,7 @@ def cmd_item(args):
         print(f"\nAbstract:\n{abstract}")
     
     # Check for attachments
-    resp2 = api_get(f"{prefix}/items/{args.key}/children", key)
+    resp2 = api_get(f"{prefix}/items/{args.key}/children", key, limit=API_FETCH_LIMIT)
     children = resp2.json()
     attachments = [c for c in children if c.get("data", {}).get("itemType") == "attachment"]
     if attachments:
@@ -297,7 +301,7 @@ def cmd_pdf(args):
     
     if data.get("itemType") != "attachment":
         # This is a parent item - find PDF attachment
-        resp2 = api_get(f"{prefix}/items/{args.key}/children", api_key)
+        resp2 = api_get(f"{prefix}/items/{args.key}/children", api_key, limit=API_FETCH_LIMIT)
         children = resp2.json()
         
         pdf_attachments = [
@@ -350,7 +354,7 @@ def cmd_collections(args):
     """List collections."""
     prefix, key = get_library_info(args.library)
     
-    resp = api_get(f"{prefix}/collections", key, limit=100)
+    resp = api_get(f"{prefix}/collections", key, limit=API_FETCH_LIMIT)
     collections = resp.json()
     
     if not collections:
@@ -377,7 +381,7 @@ def cmd_tags(args):
     """List tags."""
     prefix, key = get_library_info(args.library)
     
-    resp = api_get(f"{prefix}/tags", key, limit=100)
+    resp = api_get(f"{prefix}/tags", key, limit=API_FETCH_LIMIT)
     tags = resp.json()
     
     if not tags:
@@ -394,7 +398,7 @@ def get_or_create_collection(name: str, library: str = "group"):
     prefix, key = get_library_info(library)
     
     # Get all collections
-    resp = api_get(f"{prefix}/collections", key, limit=100)
+    resp = api_get(f"{prefix}/collections", key, limit=API_FETCH_LIMIT)
     collections = resp.json()
     
     # Search for collection by name (case-insensitive)
@@ -924,7 +928,7 @@ def cmd_notes(args):
     """List notes attached to an item."""
     prefix, api_key = get_library_info(args.library)
     
-    resp = api_get(f"{prefix}/items/{args.key}/children", api_key)
+    resp = api_get(f"{prefix}/items/{args.key}/children", api_key, limit=API_FETCH_LIMIT)
     children = resp.json()
     
     notes = [c for c in children if c.get("data", {}).get("itemType") == "note"]
@@ -959,7 +963,7 @@ def cmd_annotations(args):
         attachment_keys = [attachment_key]
     else:
         # Key is a parent item, find PDF attachments
-        resp = api_get(f"{prefix}/items/{args.key}/children", api_key)
+        resp = api_get(f"{prefix}/items/{args.key}/children", api_key, limit=API_FETCH_LIMIT)
         children = resp.json()
         attachment_keys = [
             c["data"]["key"] for c in children 
@@ -971,11 +975,13 @@ def cmd_annotations(args):
             print("No PDF attachments found for this item.")
             return
     
-    # Get annotations for each PDF attachment
+    # Get annotations for each PDF attachment (API_FETCH_LIMIT avoids default 25 pagination)
     all_annotations = []
     for att_key in attachment_keys:
-        resp = api_get(f"{prefix}/items/{att_key}/children", api_key)
+        resp = api_get(f"{prefix}/items/{att_key}/children", api_key, limit=API_FETCH_LIMIT)
         children = resp.json()
+        if len(children) >= API_FETCH_LIMIT:
+            print(f"⚠️  Warning: {len(children)} children returned (hit API limit). Some annotations may be missing!", file=sys.stderr)
         annotations = [c for c in children if c.get("data", {}).get("itemType") == "annotation"]
         for ann in annotations:
             ann["_attachment_key"] = att_key
@@ -1222,7 +1228,7 @@ def cmd_index(args):
             sys.exit(1)
         
         # Fetch all items from group library (filter out attachments and notes)
-        resp = api_get(f"{prefix}/items", api_key, limit=100)
+        resp = api_get(f"{prefix}/items", api_key, limit=API_FETCH_LIMIT)
         all_items = resp.json()
         library_items = [
             item for item in all_items 
@@ -1330,17 +1336,19 @@ def cmd_copy(args):
     print(f"  Title: {source_data.get('title', '?')}")
     
     # 2. Get children (attachments, notes)
-    resp = api_get(f"{src_prefix}/items/{item_key}/children", src_key)
+    resp = api_get(f"{src_prefix}/items/{item_key}/children", src_key, limit=API_FETCH_LIMIT)
     children = resp.json()
     
     pdf_attachments = []
     for child in children:
         child_data = child.get("data", {})
         if child_data.get("contentType") == "application/pdf":
-            # Get annotations for this PDF
+            # Get annotations for this PDF (API_FETCH_LIMIT avoids default 25 pagination)
             pdf_key = child_data.get("key")
-            resp = api_get(f"{src_prefix}/items/{pdf_key}/children", src_key)
+            resp = api_get(f"{src_prefix}/items/{pdf_key}/children", src_key, limit=API_FETCH_LIMIT)
             pdf_children = resp.json()
+            if len(pdf_children) >= API_FETCH_LIMIT:
+                print(f"  ⚠️  Warning: {len(pdf_children)} children returned (hit API limit). Some annotations may be missing!", file=sys.stderr)
             annotations = [
                 c.get("data") for c in pdf_children
                 if c.get("data", {}).get("itemType") == "annotation"
