@@ -14,6 +14,7 @@ Usage:
     zot notes <key> [--library personal|group]
     zot annotations <key> [--library personal|group] [--format text|json] [--full]
     zot render <key> <note.md> [-o name.pdf] [--no-attach] [--keep-tex]
+    zot copy <key> [--from personal|group] [--to personal|group] [-c collection]
     zot cite <key> [--style apa|chicago|bibtex] [--library personal|group]
     zot recent [--library personal|group] [--limit N]
     zot export <key> [--format bibtex|ris|csljson] [--library personal|group]
@@ -615,7 +616,7 @@ def upload_pdf(prefix: str, api_key: str, parent_key: str, pdf_path: str):
     
     if auth.get("exists"):
         print(f"PDF already exists on server, linked to attachment {att_key}")
-        return
+        return att_key
     
     # Upload the file
     upload_url = auth.get("url")
@@ -651,8 +652,10 @@ def upload_pdf(prefix: str, api_key: str, parent_key: str, pdf_path: str):
     
     if reg_resp.status_code == 204:
         print(f"Uploaded PDF: {pdf_file.name} -> {att_key}")
+        return att_key
     else:
         print(f"Failed to register upload: {reg_resp.status_code}", file=sys.stderr)
+        return None
 
 def download_file(url: str, filename: str = None) -> Path:
     """Download a file from URL to papers directory. Returns Path to downloaded file."""
@@ -1297,6 +1300,152 @@ def cmd_index(args):
                 print(f"    ... and {len(unindexed) - 5} more")
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Copy (between libraries)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cmd_copy(args):
+    """Copy an item (with PDF and annotations) from personal to group library."""
+    source_lib = args.source_library
+    target_lib = args.target_library
+    
+    if source_lib == target_lib:
+        print("Error: Source and target library must be different", file=sys.stderr)
+        sys.exit(1)
+    
+    src_prefix, src_key = get_library_info(source_lib)
+    tgt_prefix, tgt_key = get_library_info(target_lib)
+    
+    item_key = args.key
+    
+    # 1. Get source item
+    print(f"Fetching item {item_key} from {source_lib} library...")
+    resp = api_get(f"{src_prefix}/items/{item_key}", src_key)
+    source_item = resp.json()
+    source_data = source_item.get("data", {})
+    
+    if source_data.get("itemType") in ("attachment", "note", "annotation"):
+        print("Error: Cannot copy attachments/notes/annotations directly. Copy the parent item.", file=sys.stderr)
+        sys.exit(1)
+    
+    print(f"  Title: {source_data.get('title', '?')}")
+    
+    # 2. Get children (attachments, notes)
+    resp = api_get(f"{src_prefix}/items/{item_key}/children", src_key)
+    children = resp.json()
+    
+    pdf_attachments = []
+    for child in children:
+        child_data = child.get("data", {})
+        if child_data.get("contentType") == "application/pdf":
+            # Get annotations for this PDF
+            pdf_key = child_data.get("key")
+            resp = api_get(f"{src_prefix}/items/{pdf_key}/children", src_key)
+            pdf_children = resp.json()
+            annotations = [
+                c.get("data") for c in pdf_children
+                if c.get("data", {}).get("itemType") == "annotation"
+            ]
+            pdf_attachments.append({
+                "data": child_data,
+                "annotations": annotations
+            })
+    
+    print(f"  Found {len(pdf_attachments)} PDF attachment(s)")
+    for pdf in pdf_attachments:
+        print(f"    - {pdf['data'].get('filename', '?')} ({len(pdf['annotations'])} annotations)")
+    
+    # 3. Create new item in target library
+    # Build clean item data (remove keys that shouldn't be copied)
+    new_item = {k: v for k, v in source_data.items() 
+                if k not in ("key", "version", "parentItem", "dateAdded", "dateModified")}
+    new_item["collections"] = []  # Will add to collection separately if specified
+    
+    resp = api_post(f"{tgt_prefix}/items", tgt_key, [new_item])
+    result = resp.json()
+    
+    if not result.get("successful"):
+        print(f"Error creating item: {result}", file=sys.stderr)
+        sys.exit(1)
+    
+    new_item_key = list(result["successful"].values())[0].get("key")
+    print(f"Created item in {target_lib} library: {new_item_key}")
+    
+    # 4. Add to collection if specified
+    if args.collection:
+        collection_key = get_or_create_collection(args.collection, target_lib)
+        if collection_key:
+            add_item_to_collection(new_item_key, collection_key, target_lib)
+            print(f"  → Added to collection: {args.collection}")
+    
+    # 5. Download and upload PDFs, then create annotations
+    for pdf_info in pdf_attachments:
+        pdf_data = pdf_info["data"]
+        annotations = pdf_info["annotations"]
+        old_pdf_key = pdf_data.get("key")
+        
+        # Download PDF from source
+        print(f"  Downloading PDF: {pdf_data.get('filename', old_pdf_key)}...")
+        resp = api_get(f"{src_prefix}/items/{old_pdf_key}/file", src_key)
+        
+        # Save to local storage
+        zotero_dir = ZOTERO_LOCAL_DIR
+        zotero_dir.mkdir(parents=True, exist_ok=True)
+        filename = pdf_data.get("filename", f"{old_pdf_key}.pdf")
+        local_path = zotero_dir / filename
+        local_path.write_bytes(resp.content)
+        print(f"    Saved to: {local_path}")
+        
+        # Upload to target library
+        print(f"  Uploading PDF to {target_lib} library...")
+        new_pdf_key = upload_pdf(tgt_prefix, tgt_key, new_item_key, str(local_path))
+        
+        if not new_pdf_key:
+            print("    Warning: Failed to upload PDF, skipping annotations")
+            continue
+        
+        print(f"    New PDF attachment key: {new_pdf_key}")
+        
+        # 6. Create annotations on new PDF
+        if annotations:
+            print(f"  Creating {len(annotations)} annotation(s)...")
+            
+            for ann in annotations:
+                # Build annotation item for target
+                new_ann = {
+                    "itemType": "annotation",
+                    "parentItem": new_pdf_key,
+                    "annotationType": ann.get("annotationType"),
+                    "annotationText": ann.get("annotationText", ""),
+                    "annotationComment": ann.get("annotationComment", ""),
+                    "annotationColor": ann.get("annotationColor", "#ffd400"),
+                    "annotationPageLabel": ann.get("annotationPageLabel", ""),
+                    "annotationSortIndex": ann.get("annotationSortIndex", ""),
+                    "annotationPosition": ann.get("annotationPosition", "{}"),
+                    "tags": ann.get("tags", []),
+                }
+                
+                resp = api_post(f"{tgt_prefix}/items", tgt_key, [new_ann])
+                result = resp.json()
+                
+                if result.get("successful"):
+                    ann_type = ann.get("annotationType", "?")
+                    page = ann.get("annotationPageLabel", "?")
+                    print(f"    ✓ {ann_type} on page {page}")
+                else:
+                    print(f"    ✗ Failed: {result.get('failed', result)}")
+    
+    # 7. Update local index
+    index = load_index()
+    if new_item_key and pdf_attachments:
+        new_meta = extract_index_metadata(source_data, target_lib, pdf_attachments[0]["data"].get("filename"))
+        index["items"][new_item_key] = new_meta
+        save_index(index)
+        print(f"  → Indexed as [{new_item_key}]")
+    
+    print(f"\n✓ Copy complete: {item_key} → {new_item_key}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1414,6 +1563,15 @@ def main():
     p_render.add_argument("--no-attach", action="store_true", help="Don't upload to Zotero, just create local PDF")
     p_render.add_argument("--keep-tex", action="store_true", help="Also save intermediate .tex file")
     
+    # copy (between libraries, with annotations)
+    p_copy = subparsers.add_parser("copy", help="Copy item (with PDF + annotations) between libraries")
+    p_copy.add_argument("key", help="Item key to copy")
+    p_copy.add_argument("--from", dest="source_library", choices=["personal", "group"], default="personal",
+                        help="Source library (default: personal)")
+    p_copy.add_argument("--to", dest="target_library", choices=["personal", "group"], default="group",
+                        help="Target library (default: group)")
+    p_copy.add_argument("--collection", "-c", help="Add to collection in target library")
+    
     args = parser.parse_args()
     
     commands = {
@@ -1432,6 +1590,7 @@ def main():
         "export": cmd_export,
         "index": cmd_index,
         "render": cmd_render,
+        "copy": cmd_copy,
     }
     
     commands[args.command](args)

@@ -11,6 +11,7 @@ A Python CLI for querying and managing Zotero libraries (personal read-only, gro
 **Features:**
 - Search items, download PDFs, manage collections
 - Add new items with metadata and PDF attachments
+- **Copy items between libraries** (including PDF attachments and annotations)
 - Attach notes to items (syncs to Zotero cloud + saves local markdown)
 - View PDF annotations made in Zotero's reader
 - Render markdown notes to PDF and attach to items
@@ -24,6 +25,12 @@ ZOTERO_PERSONAL_KEY=...   # API key for personal library (read-only)
 ZOTERO_GROUP_ID=...       # Group library ID
 ZOTERO_GROUP_KEY=...      # API key for group library (read/write)
 ZOTERO_LOCAL_DIR=...      # Optional: override local storage path
+```
+
+**Example - Copy item with annotations:**
+```bash
+# Copy item from personal library to group library (with all PDF annotations)
+zot copy LP99KCUZ --from personal --to group --collection my-collection
 ```
 
 **Dependencies:** Python 3.11+, `httpx`
