@@ -1,0 +1,240 @@
+#!/bin/bash
+# blog-add-reading - Add or update a reading in the Quarto blog
+#
+# CREATE MODE USAGE:
+#   blog-add-reading --title "Article Title" --author "Author Name" \
+#                    --date "2026-02-21" --url "https://..." \
+#                    --categories "topic1,topic2" [--status to-read|finished] \
+#                    [--summary "Brief description..."] \
+#                    [--commit] [--publish]
+#
+# UPDATE MODE USAGE:
+#   blog-add-reading --update slug-name [--summary "New summary"] \
+#                    [--categories "topic1,topic2"] [--status finished] \
+#                    [--commit] [--publish]
+#
+# WHAT TO LOOK UP BEFORE RUNNING (CREATE MODE):
+#   1. Article title (exact, for front matter)
+#   2. Author name (from article byline)
+#   3. Publication date (original publish date, format: YYYY-MM-DD)
+#   4. Article URL (canonical/original link)
+#   5. Relevant categories/tags (AI, philosophy, research, etc.)
+#   6. Brief summary or key excerpt (optional, can add later via --update)
+#
+# IMPORTANT: Directory name must match alphabetical start of title (slug-ified)
+#            to ensure proper sorting in Quarto listings
+#
+# FLAGS:
+#   --update SLUG  Update an existing reading instead of creating new one
+#   --commit       Auto-commit the changes
+#   --publish      Auto-publish to gh-pages (implies --commit)
+#
+# EXAMPLES (CREATE):
+#   blog-add-reading --title "The Bitter Lesson" --author "Rich Sutton" \
+#                    --date "2019-03-13" --url "http://www.incompleteideas.net/IncIdeas/BitterLesson.html" \
+#                    --categories "AI,machine-learning" --commit --publish
+#
+#   blog-add-reading --title "Secrets of Intelligence Services" --author "Ben Recht" \
+#                    --date "2026-02-21" --url "https://www.argmin.net/p/secrets-of-intelligence-services" \
+#                    --categories "AI,control-theory,cybernetics" --summary "A cybernetic explainer of Claude Code." \
+#                    --commit --publish
+#
+# EXAMPLES (UPDATE):
+#   blog-add-reading --update secrets-of-intelligence-services \
+#                    --summary "Detailed exploration of control theory in AI agents." --commit
+#
+#   blog-add-reading --update the-bitter-lesson --status finished --commit --publish
+
+set -euo pipefail
+
+BLOG_DIR="$HOME/.openclaw/workspace/blog/quarto-blog"
+READINGS_DIR="$BLOG_DIR/readings"
+
+# Default values
+STATUS=""
+SUMMARY=""
+DO_COMMIT=false
+DO_PUBLISH=false
+UPDATE_SLUG=""
+TITLE=""
+AUTHOR=""
+DATE=""
+URL=""
+CATEGORIES=""
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --update)
+      UPDATE_SLUG="$2"
+      shift 2
+      ;;
+    --title)
+      TITLE="$2"
+      shift 2
+      ;;
+    --author)
+      AUTHOR="$2"
+      shift 2
+      ;;
+    --date)
+      DATE="$2"
+      shift 2
+      ;;
+    --url)
+      URL="$2"
+      shift 2
+      ;;
+    --categories)
+      CATEGORIES="$2"
+      shift 2
+      ;;
+    --status)
+      STATUS="$2"
+      shift 2
+      ;;
+    --summary)
+      SUMMARY="$2"
+      shift 2
+      ;;
+    --commit)
+      DO_COMMIT=true
+      shift
+      ;;
+    --publish)
+      DO_PUBLISH=true
+      DO_COMMIT=true
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1"
+      exit 1
+      ;;
+  esac
+done
+
+# UPDATE MODE
+if [[ -n "$UPDATE_SLUG" ]]; then
+  READING_DIR="$READINGS_DIR/$UPDATE_SLUG"
+  INDEX_FILE="$READING_DIR/index.qmd"
+  
+  if [[ ! -f "$INDEX_FILE" ]]; then
+    echo "ERROR: Reading not found: $INDEX_FILE"
+    exit 1
+  fi
+  
+  echo "📝 Updating reading: $UPDATE_SLUG"
+  
+  # Read existing file
+  FRONTMATTER=$(awk '/^---$/,/^---$/ {print}' "$INDEX_FILE")
+  BODY=$(awk '/^---$/,/^---$/ {next} {body=body"\n"$0} END {print body}' "$INDEX_FILE")
+  
+  # Update summary if provided
+  if [[ -n "$SUMMARY" ]]; then
+    # Extract everything after second --- and before [Read the full article
+    BODY="$SUMMARY\n\n$(echo "$BODY" | grep -A 1000 '\[Read the full article')"
+    echo "   ✓ Updated summary"
+  fi
+  
+  # Update status if provided
+  if [[ -n "$STATUS" ]]; then
+    FRONTMATTER=$(echo "$FRONTMATTER" | sed "s/^status: .*/status: $STATUS/")
+    echo "   ✓ Updated status to: $STATUS"
+  fi
+  
+  # Update categories if provided
+  if [[ -n "$CATEGORIES" ]]; then
+    CATEGORIES_YAML=$(echo "$CATEGORIES" | sed 's/,/, /g')
+    FRONTMATTER=$(echo "$FRONTMATTER" | sed "s/^categories: .*/categories: [$CATEGORIES_YAML]/")
+    echo "   ✓ Updated categories"
+  fi
+  
+  # Write back to file
+  echo "$FRONTMATTER" > "$INDEX_FILE"
+  echo "$BODY" >> "$INDEX_FILE"
+  
+  echo "✅ Updated: $INDEX_FILE"
+  
+  # Commit if requested
+  if [[ "$DO_COMMIT" == true ]]; then
+    cd "$BLOG_DIR"
+    git add "$READING_DIR"
+    git commit -m "Update reading: $UPDATE_SLUG"
+    git push
+    echo "✅ Committed and pushed to master"
+  fi
+  
+  # Publish if requested
+  if [[ "$DO_PUBLISH" == true ]]; then
+    cd "$BLOG_DIR"
+    ~/.openclaw/workspace/bin/quarto publish gh-pages --no-prompt
+    echo "✅ Published to GitHub Pages"
+  fi
+  
+  exit 0
+fi
+
+# CREATE MODE - Validate required fields
+if [[ -z "$TITLE" || -z "$AUTHOR" || -z "$DATE" || -z "$URL" ]]; then
+  echo "ERROR: Missing required fields for create mode"
+  echo "Required: --title, --author, --date, --url"
+  exit 1
+fi
+
+# Set default status for create mode
+if [[ -z "$STATUS" ]]; then
+  STATUS="to-read"
+fi
+
+# Generate slug from title (lowercase, replace spaces/special chars with dashes)
+SLUG=$(echo "$TITLE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
+
+# Create directory
+READING_DIR="$READINGS_DIR/$SLUG"
+if [[ -d "$READING_DIR" ]]; then
+  echo "ERROR: Reading directory already exists: $READING_DIR"
+  echo "Use --update $SLUG to modify existing reading"
+  exit 1
+fi
+
+mkdir -p "$READING_DIR"
+
+# Parse categories into YAML list format
+CATEGORIES_YAML=$(echo "$CATEGORIES" | sed 's/,/, /g')
+
+# Generate index.qmd
+cat > "$READING_DIR/index.qmd" << EOF
+---
+title: "$TITLE"
+author: "$AUTHOR"
+date: "$DATE"
+categories: [$CATEGORIES_YAML]
+status: $STATUS
+url: "$URL"
+---
+
+${SUMMARY:-Brief description...}
+
+[Read the full article →]($URL)
+EOF
+
+echo "✅ Created reading: $READING_DIR/index.qmd"
+echo "   Title: $TITLE"
+echo "   Author: $AUTHOR"
+echo "   Slug: $SLUG"
+
+# Commit if requested
+if [[ "$DO_COMMIT" == true ]]; then
+  cd "$BLOG_DIR"
+  git add "$READING_DIR"
+  git commit -m "Add reading: $TITLE"
+  git push
+  echo "✅ Committed and pushed to master"
+fi
+
+# Publish if requested
+if [[ "$DO_PUBLISH" == true ]]; then
+  cd "$BLOG_DIR"
+  ~/.openclaw/workspace/bin/quarto publish gh-pages --no-prompt
+  echo "✅ Published to GitHub Pages"
+fi
