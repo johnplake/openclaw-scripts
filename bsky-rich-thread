@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""
+Post a Bluesky thread continuation with:
+  - URL facets (clickable links)
+  - Tweet screenshot image embeds (via platform.twitter.com embed)
+"""
+import json, re, subprocess, time, sys, os
+from pathlib import Path
+import urllib.request, urllib.parse
+
+CONFIG = Path.home() / ".config/bsky/config.json"
+PDS = "https://bsky.social"
+
+config = json.loads(CONFIG.read_text())
+IDENTIFIER = config["identifier"]
+PASSWORD = config["password"]
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+def auth():
+    data = json.dumps({"identifier": IDENTIFIER, "password": PASSWORD}).encode()
+    req = urllib.request.Request(f"{PDS}/xrpc/com.atproto.server.createSession",
+                                  data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req) as r:
+        resp = json.loads(r.read())
+    return resp["accessJwt"], resp["did"]
+
+def api_post(token, path, body=None, data=None, content_type="application/json"):
+    url = f"{PDS}/xrpc/{path}"
+    if body is not None:
+        data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data,
+                                  headers={"Authorization": f"Bearer {token}",
+                                           "Content-Type": content_type},
+                                  method="POST")
+    with urllib.request.urlopen(req) as r:
+        return json.loads(r.read())
+
+# ── Facets (clickable links) ──────────────────────────────────────────────────
+URL_RE = re.compile(
+    r'(?:https?://|(?<![a-zA-Z0-9])(?:x\.com|arxiv\.org|fleuret\.org|bsky\.app))[^\s]*'
+)
+
+def make_facets(text):
+    facets = []
+    encoded = text.encode("utf-8")
+    for m in URL_RE.finditer(text):
+        raw = m.group()
+        uri = raw if raw.startswith("http") else "https://" + raw
+        # Compute byte offsets
+        byte_start = len(text[:m.start()].encode("utf-8"))
+        byte_end = byte_start + len(raw.encode("utf-8"))
+        facets.append({
+            "$type": "app.bsky.richtext.facet",
+            "index": {"byteStart": byte_start, "byteEnd": byte_end},
+            "features": [{"$type": "app.bsky.richtext.facet#link", "uri": uri}]
+        })
+    return facets
+
+# ── Tweet screenshot ──────────────────────────────────────────────────────────
+def tweet_id_from_url(url):
+    m = re.search(r'(?:x|twitter)\.com/\w+/status/(\d+)', url)
+    return m.group(1) if m else None
+
+def screenshot_tweet(tweet_id, out_path):
+    embed_url = f"https://platform.twitter.com/embed/Tweet.html?id={tweet_id}"
+    result = subprocess.run([
+        "google-chrome-stable",
+        "--headless=new", "--no-sandbox", "--disable-gpu",
+        f"--screenshot={out_path}",
+        "--window-size=660,520",
+        "--virtual-time-budget=6000",
+        embed_url
+    ], capture_output=True, timeout=30)
+    return result.returncode == 0 and Path(out_path).exists()
+
+def upload_image(token, path):
+    data = Path(path).read_bytes()
+    resp = api_post(token, "com.atproto.repo.uploadBlob",
+                    data=data, content_type="image/png")
+    return resp["blob"]
+
+# ── Post ──────────────────────────────────────────────────────────────────────
+def post_skeet(token, did, text, root_uri, root_cid, parent_uri, parent_cid, blob=None):
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    record = {
+        "$type": "app.bsky.feed.post",
+        "text": text,
+        "createdAt": now,
+        "reply": {
+            "root": {"uri": root_uri, "cid": root_cid},
+            "parent": {"uri": parent_uri, "cid": parent_cid}
+        }
+    }
+    facets = make_facets(text)
+    if facets:
+        record["facets"] = facets
+    if blob:
+        record["embed"] = {
+            "$type": "app.bsky.embed.images",
+            "images": [{"alt": "Tweet screenshot", "image": blob}]
+        }
+    resp = api_post(token, "com.atproto.repo.createRecord", {
+        "repo": did,
+        "collection": "app.bsky.feed.post",
+        "record": record
+    })
+    return resp["uri"], resp["cid"]
+
+# ── Thread posts ──────────────────────────────────────────────────────────────
+POSTS = [
+    {
+        "text": (
+            "🤔 \"Dario Says CL Is Solved. Is It?\" — @tianle_cai\n"
+            "CL should be seen as an \"arrow\" (expanding LLMs' reliable task-horizon), not a static line. "
+            "Tracks GPT-2→Claude Opus 4.6 on task duration. Asks: capability shifted, or truly solved?"
+        ),
+        "tweet_url": None,  # no direct tweet link given
+    },
+    {
+        "text": (
+            "🔀 Parallel > sequential sampling for test-time scaling — key empirical result for inference compute budget decisions. "
+            "(Google DeepMind, @gu_xiangming, thread 1/9)\n"
+            "x.com/gu_xiangming/status/2042589755779776605"
+        ),
+        "tweet_url": "x.com/gu_xiangming/status/2042589755779776605",
+    },
+    {
+        "text": (
+            "🧪 UK AISI: \"control\" steering vectors (about books on shelves) had effects as large as deliberate evaluation-awareness vectors. "
+            "Challenges assumptions about representation specificity. (@thjread)\n"
+            "x.com/thjread/status/2042555422771495128"
+        ),
+        "tweet_url": "x.com/thjread/status/2042555422771495128",
+    },
+    {
+        "text": (
+            "📋 Benchmark papers should include \"what approach might game this eval\" sections — "
+            "following the obfuscated gradients template. Models will inevitably shortcut poorly designed benchmarks. (@ShashwatGoel7)\n"
+            "x.com/ShashwatGoel7/status/2042538142943601045"
+        ),
+        "tweet_url": "x.com/ShashwatGoel7/status/2042538142943601045",
+    },
+    {
+        "text": (
+            "📘 Nathan Lambert's Reinforcement Learning from Human Feedback book entering final production — ships in 1–2 months. "
+            "Foundational resource for the RLHF research community. (@natolambert)\n"
+            "x.com/natolambert/status/2042297879151460614"
+        ),
+        "tweet_url": "x.com/natolambert/status/2042297879151460614",
+    },
+    {
+        "text": (
+            "🌍 World models should compile into LLM-like generators (as reasoning models already do), not serve as direct planning engines. "
+            "Guarantees achievable via LRM-Modulo at test time. (@rao2z)\n"
+            "x.com/rao2z/status/2042616546372260024"
+        ),
+        "tweet_url": "x.com/rao2z/status/2042616546372260024",
+    },
+    {
+        "text": (
+            "📎 #paperclip: MCP server giving AI agents native access to 8M+ indexed papers — 10× faster than deep research approaches. "
+            "One-line setup for literature-dense agentic tasks. (@james_y_zou)\n"
+            "x.com/james_y_zou/status/2042333880947261832"
+        ),
+        "tweet_url": "x.com/james_y_zou/status/2042333880947261832",
+    },
+    {
+        "text": (
+            "👁️ Mirai (CVPR 2026): autoregressive visual generation requires lookahead/foresight during token-by-token generation — "
+            "addressing a core limitation of standard left-to-right AR visual models. (@LayneHuangLH)\n"
+            "x.com/LayneHuangLH/status/2042539486899568940"
+        ),
+        "tweet_url": "x.com/LayneHuangLH/status/2042539486899568940",
+    },
+    {
+        "text": (
+            "⚡ Meta Muse Spark: pretraining stack rebuild delivers 10x+ compute efficiency. "
+            "Major infrastructure advance for LLM pretraining at scale. (@dongheuw)\n"
+            "x.com/dongheuw/status/2042507283217944831"
+        ),
+        "tweet_url": "x.com/dongheuw/status/2042507283217944831",
+    },
+]
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+ROOT_URI  = "at://did:plc:hhrqhamegrfphvk2bqdgwkhi/app.bsky.feed.post/3mj5qpjspkb2c"
+ROOT_CID  = "bafyreibld33p5knmxpo6zy2eo7t3kfu2xxfoimpesqkeefjcaasw6vpy2q"
+PREV_URI  = "at://did:plc:hhrqhamegrfphvk2bqdgwkhi/app.bsky.feed.post/3mj5qryisqp2x"
+PREV_CID  = "bafyreiar6kykfyh44xknjds5lhlgchtk2754kfrc7bryazwiicpqrnravu"
+
+print("Authenticating...")
+token, did = auth()
+
+for i, post in enumerate(POSTS):
+    text = post["text"]
+    tweet_url = post["tweet_url"]
+    n = i + 12  # continuing from post 11
+
+    # Check length
+    glen = len(text)
+    if glen > 300:
+        print(f"  ⚠️  Post {n} is {glen} chars — TRUNCATING")
+        text = text[:297] + "..."
+
+    blob = None
+    if tweet_url:
+        tweet_id = tweet_id_from_url(tweet_url)
+        if tweet_id:
+            img_path = f"/tmp/tweet_{tweet_id}.png"
+            print(f"  📸 Screenshotting tweet {tweet_id}...")
+            ok = screenshot_tweet(tweet_id, img_path)
+            if ok:
+                print(f"  ⬆️  Uploading image...")
+                blob = upload_image(token, img_path)
+            else:
+                print(f"  ⚠️  Screenshot failed, posting without image")
+
+    print(f"[{n}] Posting: {text[:60].strip()}...")
+    uri, cid = post_skeet(token, did, text, ROOT_URI, ROOT_CID, PREV_URI, PREV_CID, blob)
+    PREV_URI = uri
+    PREV_CID = cid
+    print(f"  ✓ {uri}")
+    time.sleep(1.5)
+
+print(f"\n✅ Done! Thread: https://bsky.app/profile/jlake9.bsky.social/post/3mj5qpjspkb2c")
