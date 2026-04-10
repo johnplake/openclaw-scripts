@@ -4,12 +4,11 @@
 CONFIG="$HOME/.config/bsky/config.json"
 PDS="https://bsky.social"
 
-# Read config
-IDENTIFIER=$(cat "$CONFIG" | grep -o '"identifier": *"[^"]*"' | cut -d'"' -f4)
-PASSWORD=$(cat "$CONFIG" | grep -o '"password": *"[^"]*"' | cut -d'"' -f4)
-DID=$(cat "$CONFIG" | grep -o '"did": *"[^"]*"' | cut -d'"' -f4)
+# Read config with jq
+IDENTIFIER=$(jq -r '.identifier' "$CONFIG")
+PASSWORD=$(jq -r '.password' "$CONFIG")
 
-# Get fresh session token
+# Get fresh session (parse with jq)
 get_session() {
     curl -s -X POST "$PDS/xrpc/com.atproto.server.createSession" \
         -H "Content-Type: application/json" \
@@ -17,11 +16,20 @@ get_session() {
 }
 
 get_token() {
-    get_session | grep -o '"accessJwt":"[^"]*"' | cut -d'"' -f4
+    get_session | jq -r '.accessJwt'
 }
 
 get_did() {
-    get_session | grep -o '"did":"[^"]*"' | cut -d'"' -f4
+    get_session | jq -r '.did'
+}
+
+# Authenticate once and export TOKEN + DID for thread/batch use
+_auth() {
+    local session
+    session=$(get_session)
+    TOKEN=$(echo "$session" | jq -r '.accessJwt')
+    DID=$(echo "$session" | jq -r '.did')
+    export TOKEN DID
 }
 
 # Post a skeet (supports --reply-to for replies)
@@ -186,6 +194,95 @@ search() {
         -H "Authorization: Bearer $token"
 }
 
+# Post a thread from a file or stdin.
+# Posts are separated by a line containing only "---".
+# Usage:
+#   bsky thread posts.txt
+#   echo -e "Post 1\n---\nPost 2" | bsky thread
+thread() {
+    local input_file="${1:-}"
+    local raw
+
+    if [[ -n "$input_file" && -f "$input_file" ]]; then
+        raw=$(cat "$input_file")
+    else
+        raw=$(cat)
+    fi
+
+    # Split on lines that are exactly "---"
+    mapfile -d '' POSTS < <(echo "$raw" | awk 'BEGIN{RS=""; ORS="\0"} {print}' | \
+        python3 -c "
+import sys, re
+text = sys.stdin.read()
+parts = re.split(r'\n---\n', text)
+for p in parts:
+    p = p.strip()
+    if p:
+        sys.stdout.buffer.write(p.encode() + b'\x00')
+")
+
+    if [[ ${#POSTS[@]} -eq 0 ]]; then
+        echo "Error: no posts found (separate posts with a line containing only ---)" >&2
+        exit 1
+    fi
+
+    # Authenticate once
+    _auth
+
+    local ROOT_URI="" ROOT_CID="" PREV_URI="" PREV_CID=""
+    local now
+
+    for i in "${!POSTS[@]}"; do
+        local text="${POSTS[$i]}"
+        now=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
+        local record RESP URI CID
+
+        if [[ $i -eq 0 ]]; then
+            record=$(jq -n \
+                --arg text "$text" \
+                --arg now "$now" \
+                '{"$type":"app.bsky.feed.post","text":$text,"createdAt":$now}')
+        else
+            record=$(jq -n \
+                --arg text "$text" \
+                --arg now "$now" \
+                --arg root_uri "$ROOT_URI" \
+                --arg root_cid "$ROOT_CID" \
+                --arg parent_uri "$PREV_URI" \
+                --arg parent_cid "$PREV_CID" \
+                '{"$type":"app.bsky.feed.post","text":$text,"createdAt":$now,
+                  "reply":{"root":{"uri":$root_uri,"cid":$root_cid},
+                           "parent":{"uri":$parent_uri,"cid":$parent_cid}}}')
+        fi
+
+        RESP=$(curl -s -X POST "$PDS/xrpc/com.atproto.repo.createRecord" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"repo\":\"$DID\",\"collection\":\"app.bsky.feed.post\",\"record\":$record}")
+
+        URI=$(echo "$RESP" | jq -r '.uri')
+        CID=$(echo "$RESP" | jq -r '.cid')
+
+        if [[ "$URI" == "null" || -z "$URI" ]]; then
+            echo "Error posting [$((i+1))/${#POSTS[@]}]: $(echo "$RESP" | jq -r '.message // .')" >&2
+            exit 1
+        fi
+
+        if [[ $i -eq 0 ]]; then
+            ROOT_URI="$URI"
+            ROOT_CID="$CID"
+        fi
+        PREV_URI="$URI"
+        PREV_CID="$CID"
+
+        echo "[$((i+1))/${#POSTS[@]}] ✓ $URI"
+        [[ $i -lt $((${#POSTS[@]}-1)) ]] && sleep 1
+    done
+
+    echo ""
+    echo "✅ Thread posted: https://bsky.app/profile/${IDENTIFIER}/post/${ROOT_URI##*/}"
+}
+
 case "$1" in
     post)
         shift
@@ -213,21 +310,27 @@ case "$1" in
         shift
         search "$*"
         ;;
+    thread)
+        shift
+        thread "$@"
+        ;;
     token)
         get_token
         ;;
     *)
         echo "Usage: bsky <command> [args]"
         echo "Commands:"
-        echo "  post <text>           - Post a skeet"
-        echo "  post <text> --reply-to <uri> - Reply to a post"
-        echo "  like <uri> <cid>      - Like a post"
-        echo "  follow <did>          - Follow a user"
-        echo "  repost <uri> <cid>    - Repost"
-        echo "  timeline [n]          - Get timeline (default 10)"
-        echo "  profile [handle]      - Get profile"
-        echo "  notifications [n]     - Get notifications"
-        echo "  search <query> [n]    - Search posts"
-        echo "  token                 - Get fresh session token"
+        echo "  post <text>                   - Post a skeet"
+        echo "  post <text> --reply-to <uri>  - Reply to a post"
+        echo "  thread [file]                 - Post a thread (posts separated by --- lines)"
+        echo "                                  reads from file or stdin"
+        echo "  like <uri> <cid>              - Like a post"
+        echo "  follow <did>                  - Follow a user"
+        echo "  repost <uri> <cid>            - Repost"
+        echo "  timeline [n]                  - Get timeline (default 10)"
+        echo "  profile [handle]              - Get profile"
+        echo "  notifications [n]             - Get notifications"
+        echo "  search <query> [n]            - Search posts"
+        echo "  token                         - Get fresh session token"
         ;;
 esac
