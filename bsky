@@ -199,19 +199,193 @@ search() {
 # Usage:
 #   bsky thread posts.txt
 #   echo -e "Post 1\n---\nPost 2" | bsky thread
+#   bsky thread posts.txt --rich
+#   bsky thread posts.txt --screenshots
+#   bsky thread posts.txt --rich --continue ROOT_URI ROOT_CID PREV_URI PREV_CID
 thread() {
-    local input_file="${1:-}"
-    local raw
+    local input_file=""
+    local rich=0
+    local screenshots=0
+    local cont_root_uri="" cont_root_cid="" cont_prev_uri="" cont_prev_cid=""
 
-    if [[ -n "$input_file" && -f "$input_file" ]]; then
-        raw=$(cat "$input_file")
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --rich)        rich=1; shift ;;
+            --screenshots) screenshots=1; rich=1; shift ;;
+            --continue)
+                cont_root_uri="$2"; cont_root_cid="$3"
+                cont_prev_uri="$4"; cont_prev_cid="$5"
+                shift 5 ;;
+            -*)  echo "Unknown flag: $1" >&2; return 1 ;;
+            *)   input_file="$1"; shift ;;
+        esac
+    done
+
+    if [[ $rich -eq 1 ]]; then
+        # ── Rich mode: URL facets + optional tweet screenshots (Python) ──────────
+        BSKY_INPUT_FILE="$input_file" \
+        BSKY_SCREENSHOTS="$screenshots" \
+        BSKY_CONFIG="$CONFIG" \
+        BSKY_CONT_ROOT_URI="$cont_root_uri" \
+        BSKY_CONT_ROOT_CID="$cont_root_cid" \
+        BSKY_CONT_PREV_URI="$cont_prev_uri" \
+        BSKY_CONT_PREV_CID="$cont_prev_cid" \
+        python3 << 'PYEOF'
+import json, re, subprocess, sys, os, time
+from pathlib import Path
+import urllib.request
+from datetime import datetime, timezone
+
+PDS         = "https://bsky.social"
+cfg_path    = os.environ["BSKY_CONFIG"]
+config      = json.loads(Path(cfg_path).read_text())
+IDENT       = config["identifier"]
+PASSWORD    = config["password"]
+SCREENSHOTS = os.environ.get("BSKY_SCREENSHOTS", "0") == "1"
+INPUT_FILE  = os.environ.get("BSKY_INPUT_FILE", "")
+CONT_ROOT_URI = os.environ.get("BSKY_CONT_ROOT_URI", "")
+CONT_ROOT_CID = os.environ.get("BSKY_CONT_ROOT_CID", "")
+CONT_PREV_URI = os.environ.get("BSKY_CONT_PREV_URI", "")
+CONT_PREV_CID = os.environ.get("BSKY_CONT_PREV_CID", "")
+
+def auth():
+    data = json.dumps({"identifier": IDENT, "password": PASSWORD}).encode()
+    req = urllib.request.Request(
+        f"{PDS}/xrpc/com.atproto.server.createSession",
+        data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req) as r:
+        resp = json.loads(r.read())
+    return resp["accessJwt"], resp["did"]
+
+def api_post(token, path, body=None, data=None, content_type="application/json"):
+    url = f"{PDS}/xrpc/{path}"
+    if body is not None:
+        data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": content_type},
+        method="POST")
+    with urllib.request.urlopen(req) as r:
+        return json.loads(r.read())
+
+# URL_RE matches bare x.com/arxiv.org/bsky.app/fleuret.org links and full https:// URLs
+URL_RE = re.compile(
+    r'(?:https?://|(?<![a-zA-Z0-9])(?:x\.com|arxiv\.org|fleuret\.org|bsky\.app))[^\s]*'
+)
+
+def make_facets(text):
+    facets = []
+    for m in URL_RE.finditer(text):
+        raw = m.group()
+        uri = raw if raw.startswith("http") else "https://" + raw
+        byte_start = len(text[:m.start()].encode("utf-8"))
+        byte_end   = byte_start + len(raw.encode("utf-8"))
+        facets.append({
+            "$type": "app.bsky.richtext.facet",
+            "index": {"byteStart": byte_start, "byteEnd": byte_end},
+            "features": [{"$type": "app.bsky.richtext.facet#link", "uri": uri}]
+        })
+    return facets
+
+def screenshot_tweet(tweet_id, out_path):
+    embed_url = f"https://platform.twitter.com/embed/Tweet.html?id={tweet_id}"
+    result = subprocess.run([
+        "google-chrome-stable",
+        "--headless=new", "--no-sandbox", "--disable-gpu",
+        f"--screenshot={out_path}",
+        "--window-size=660,520",
+        "--virtual-time-budget=6000",
+        embed_url
+    ], capture_output=True, timeout=30)
+    return result.returncode == 0 and Path(out_path).exists()
+
+def upload_image(token, path):
+    data = Path(path).read_bytes()
+    resp = api_post(token, "com.atproto.repo.uploadBlob", data=data, content_type="image/png")
+    return resp["blob"]
+
+def create_post(token, did, text, root_uri, root_cid, parent_uri, parent_cid, blob=None):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    record = {"$type": "app.bsky.feed.post", "text": text, "createdAt": now}
+    if root_uri:
+        record["reply"] = {
+            "root":   {"uri": root_uri,   "cid": root_cid},
+            "parent": {"uri": parent_uri, "cid": parent_cid}
+        }
+    facets = make_facets(text)
+    if facets:
+        record["facets"] = facets
+    if blob:
+        record["embed"] = {
+            "$type": "app.bsky.embed.images",
+            "images": [{"alt": "Tweet screenshot", "image": blob}]
+        }
+    resp = api_post(token, "com.atproto.repo.createRecord", {
+        "repo": did, "collection": "app.bsky.feed.post", "record": record
+    })
+    return resp["uri"], resp["cid"]
+
+# ── Read posts ────────────────────────────────────────────────────────────────
+if INPUT_FILE and Path(INPUT_FILE).exists():
+    raw = Path(INPUT_FILE).read_text()
+else:
+    raw = sys.stdin.read()
+
+posts = [p.strip() for p in re.split(r'\n---\n', raw) if p.strip()]
+if not posts:
+    print("Error: no posts found (separate posts with a line containing only ---)", file=sys.stderr)
+    sys.exit(1)
+
+for i, p in enumerate(posts):
+    if len(p) > 300:
+        print(f"  ⚠️  Post {i+1} is {len(p)} chars (>300) — will be truncated to 300", file=sys.stderr)
+
+print(f"Authenticating... ({len(posts)} post(s){'  [screenshots on]' if SCREENSHOTS else ''}{'  [continuing thread]' if CONT_ROOT_URI else ''})")
+token, did = auth()
+
+root_uri, root_cid = CONT_ROOT_URI, CONT_ROOT_CID
+prev_uri, prev_cid = CONT_PREV_URI, CONT_PREV_CID
+
+for i, text in enumerate(posts):
+    if len(text) > 300:
+        text = text[:297] + "..."
+
+    blob = None
+    if SCREENSHOTS:
+        m = re.search(r'(?:x|twitter)\.com/\w+/status/(\d+)', text)
+        if m:
+            tweet_id = m.group(1)
+            img_path = f"/tmp/tweet_{tweet_id}.png"
+            print(f"  📸 Screenshotting tweet {tweet_id}...")
+            if screenshot_tweet(tweet_id, img_path):
+                print(f"  ⬆️  Uploading image...")
+                blob = upload_image(token, img_path)
+            else:
+                print(f"  ⚠️  Screenshot failed, posting without image")
+
+    print(f"[{i+1}/{len(posts)}] Posting: {text[:60].strip()}...")
+    uri, cid = create_post(token, did, text, root_uri, root_cid, prev_uri, prev_cid, blob)
+    if not root_uri:
+        root_uri, root_cid = uri, cid
+    prev_uri, prev_cid = uri, cid
+    print(f"  ✓ {uri}")
+    if i < len(posts) - 1:
+        time.sleep(1.5)
+
+print(f"\n✅ Thread: https://bsky.app/profile/{IDENT}/post/{root_uri.split('/')[-1]}")
+PYEOF
+
     else
-        raw=$(cat)
-    fi
+        # ── Plain mode: no facets, pure bash ─────────────────────────────────────
+        local input_file_plain="${input_file:-}"
+        local raw
 
-    # Split on lines that are exactly "---"
-    mapfile -d '' POSTS < <(echo "$raw" | awk 'BEGIN{RS=""; ORS="\0"} {print}' | \
-        python3 -c "
+        if [[ -n "$input_file_plain" && -f "$input_file_plain" ]]; then
+            raw=$(cat "$input_file_plain")
+        else
+            raw=$(cat)
+        fi
+
+        mapfile -d '' POSTS < <(echo "$raw" | python3 -c "
 import sys, re
 text = sys.stdin.read()
 parts = re.split(r'\n---\n', text)
@@ -221,66 +395,66 @@ for p in parts:
         sys.stdout.buffer.write(p.encode() + b'\x00')
 ")
 
-    if [[ ${#POSTS[@]} -eq 0 ]]; then
-        echo "Error: no posts found (separate posts with a line containing only ---)" >&2
-        exit 1
-    fi
-
-    # Authenticate once
-    _auth
-
-    local ROOT_URI="" ROOT_CID="" PREV_URI="" PREV_CID=""
-    local now
-
-    for i in "${!POSTS[@]}"; do
-        local text="${POSTS[$i]}"
-        now=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
-        local record RESP URI CID
-
-        if [[ $i -eq 0 ]]; then
-            record=$(jq -n \
-                --arg text "$text" \
-                --arg now "$now" \
-                '{"$type":"app.bsky.feed.post","text":$text,"createdAt":$now}')
-        else
-            record=$(jq -n \
-                --arg text "$text" \
-                --arg now "$now" \
-                --arg root_uri "$ROOT_URI" \
-                --arg root_cid "$ROOT_CID" \
-                --arg parent_uri "$PREV_URI" \
-                --arg parent_cid "$PREV_CID" \
-                '{"$type":"app.bsky.feed.post","text":$text,"createdAt":$now,
-                  "reply":{"root":{"uri":$root_uri,"cid":$root_cid},
-                           "parent":{"uri":$parent_uri,"cid":$parent_cid}}}')
-        fi
-
-        RESP=$(curl -s -X POST "$PDS/xrpc/com.atproto.repo.createRecord" \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "{\"repo\":\"$DID\",\"collection\":\"app.bsky.feed.post\",\"record\":$record}")
-
-        URI=$(echo "$RESP" | jq -r '.uri')
-        CID=$(echo "$RESP" | jq -r '.cid')
-
-        if [[ "$URI" == "null" || -z "$URI" ]]; then
-            echo "Error posting [$((i+1))/${#POSTS[@]}]: $(echo "$RESP" | jq -r '.message // .')" >&2
+        if [[ ${#POSTS[@]} -eq 0 ]]; then
+            echo "Error: no posts found (separate posts with a line containing only ---)" >&2
             exit 1
         fi
 
-        if [[ $i -eq 0 ]]; then
-            ROOT_URI="$URI"
-            ROOT_CID="$CID"
-        fi
-        PREV_URI="$URI"
-        PREV_CID="$CID"
+        _auth
 
-        echo "[$((i+1))/${#POSTS[@]}] ✓ $URI"
-        [[ $i -lt $((${#POSTS[@]}-1)) ]] && sleep 1
-    done
+        local ROOT_URI="" ROOT_CID="" PREV_URI="" PREV_CID=""
+        local now
 
-    echo ""
-    echo "✅ Thread posted: https://bsky.app/profile/${IDENTIFIER}/post/${ROOT_URI##*/}"
+        for i in "${!POSTS[@]}"; do
+            local text="${POSTS[$i]}"
+            now=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
+            local record RESP URI CID
+
+            if [[ $i -eq 0 ]]; then
+                record=$(jq -n \
+                    --arg text "$text" \
+                    --arg now "$now" \
+                    '{"$type":"app.bsky.feed.post","text":$text,"createdAt":$now}')
+            else
+                record=$(jq -n \
+                    --arg text "$text" \
+                    --arg now "$now" \
+                    --arg root_uri "$ROOT_URI" \
+                    --arg root_cid "$ROOT_CID" \
+                    --arg parent_uri "$PREV_URI" \
+                    --arg parent_cid "$PREV_CID" \
+                    '{"$type":"app.bsky.feed.post","text":$text,"createdAt":$now,
+                      "reply":{"root":{"uri":$root_uri,"cid":$root_cid},
+                               "parent":{"uri":$parent_uri,"cid":$parent_cid}}}')
+            fi
+
+            RESP=$(curl -s -X POST "$PDS/xrpc/com.atproto.repo.createRecord" \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "{\"repo\":\"$DID\",\"collection\":\"app.bsky.feed.post\",\"record\":$record}")
+
+            URI=$(echo "$RESP" | jq -r '.uri')
+            CID=$(echo "$RESP" | jq -r '.cid')
+
+            if [[ "$URI" == "null" || -z "$URI" ]]; then
+                echo "Error posting [$((i+1))/${#POSTS[@]}]: $(echo "$RESP" | jq -r '.message // .')" >&2
+                exit 1
+            fi
+
+            if [[ $i -eq 0 ]]; then
+                ROOT_URI="$URI"
+                ROOT_CID="$CID"
+            fi
+            PREV_URI="$URI"
+            PREV_CID="$CID"
+
+            echo "[$((i+1))/${#POSTS[@]}] ✓ $URI"
+            [[ $i -lt $((${#POSTS[@]}-1)) ]] && sleep 1
+        done
+
+        echo ""
+        echo "✅ Thread posted: https://bsky.app/profile/${IDENTIFIER}/post/${ROOT_URI##*/}"
+    fi
 }
 
 case "$1" in
@@ -324,6 +498,10 @@ case "$1" in
         echo "  post <text> --reply-to <uri>  - Reply to a post"
         echo "  thread [file]                 - Post a thread (posts separated by --- lines)"
         echo "                                  reads from file or stdin"
+        echo "    --rich                          Enable URL facets (clickable links)"
+        echo "    --screenshots                   Embed tweet screenshots (implies --rich)"
+        echo "    --continue ROOT_URI ROOT_CID PREV_URI PREV_CID"
+        echo "                                  Continue an existing thread"
         echo "  like <uri> <cid>              - Like a post"
         echo "  follow <did>                  - Follow a user"
         echo "  repost <uri> <cid>            - Repost"
