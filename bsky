@@ -231,7 +231,7 @@ thread() {
         BSKY_CONT_PREV_URI="$cont_prev_uri" \
         BSKY_CONT_PREV_CID="$cont_prev_cid" \
         python3 << 'PYEOF'
-import json, re, subprocess, sys, os, time
+import json, re, shutil, subprocess, sys, os, time
 from pathlib import Path
 import urllib.request
 from datetime import datetime, timezone
@@ -286,10 +286,25 @@ def make_facets(text):
         })
     return facets
 
+def find_screenshot_browser():
+    candidates = []
+    override = os.environ.get("BSKY_SCREENSHOT_BROWSER")
+    if override:
+        candidates.append(override)
+    candidates.extend(["google-chrome-stable", "chromium", "chromium-browser"])
+    for candidate in candidates:
+        path = shutil.which(candidate)
+        if path:
+            return path
+    return None
+
 def screenshot_tweet(tweet_id, out_path):
     embed_url = f"https://platform.twitter.com/embed/Tweet.html?id={tweet_id}"
+    browser = find_screenshot_browser()
+    if not browser:
+        return False
     result = subprocess.run([
-        "google-chrome-stable",
+        browser,
         "--headless=new", "--no-sandbox", "--disable-gpu",
         f"--screenshot={out_path}",
         "--window-size=660,520",
@@ -338,6 +353,14 @@ if not posts:
 for i, p in enumerate(posts):
     if len(p) > 300:
         print(f"  ⚠️  Post {i+1} is {len(p)} chars (>300) — will be truncated to 300", file=sys.stderr)
+
+if SCREENSHOTS and not find_screenshot_browser():
+    print(
+        "Error: --screenshots requested but no supported browser was found "
+        "(tried google-chrome-stable, chromium, chromium-browser).",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 print(f"Authenticating... ({len(posts)} post(s){'  [screenshots on]' if SCREENSHOTS else ''}{'  [continuing thread]' if CONT_ROOT_URI else ''})")
 token, did = auth()
